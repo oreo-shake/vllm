@@ -37,6 +37,7 @@ def expert_num_tokens_round_up_and_sum(expert_num_tokens: torch.Tensor) -> int:
 def compute_aligned_M(M: int, num_topk: int, local_num_experts: int,
                       alignment: int,
                       expert_tokens_meta: Optional[mk.ExpertTokensMetadata]):
+
     if ((expert_tokens_meta is not None)
             and (expert_tokens_meta.expert_num_tokens_cpu is not None)):
         return expert_num_tokens_round_up_and_sum(
@@ -336,7 +337,7 @@ def ep_gather(
 def deepgemm_moe_permute(aq: torch.Tensor,
                          aq_scale: torch.Tensor,
                          topk_ids: torch.Tensor,
-                         local_num_experts: torch.Tensor,
+                         local_num_experts: int,
                          expert_map: Optional[torch.Tensor],
                          expert_tokens_meta: Optional[mk.ExpertTokensMetadata],
                          aq_out: Optional[torch.Tensor] = None):
@@ -378,7 +379,7 @@ def deepgemm_moe_permute(aq: torch.Tensor,
 
     expert_num_tokens = None
     if expert_tokens_meta is not None:
-        expert_num_tokens = expert_tokens_meta.expert_num_tokens_gpu
+        expert_num_tokens = expert_tokens_meta.expert_num_tokens
     else:
         expert_num_tokens = count_expert_num_tokens(topk_ids,
                                                     local_num_experts,

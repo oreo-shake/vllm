@@ -480,7 +480,8 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         (workspace13_shape, workspace2_shape, fused_out_shape,
          workspace_dtype) = self.fused_experts.workspace_shapes(
-             a1, a1q, M, N, K, top_k, global_num_experts, local_num_experts)
+             a1, a1q, M, N, K, top_k, global_num_experts, local_num_experts,
+             expert_tokens_meta)
 
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
@@ -573,10 +574,9 @@ class FusedMoEModularKernel(torch.nn.Module):
         assert num_chunks > 1
 
         # Construct the entire output that can then be processed in chunks.
-        (_, _, fused_out_shape,
-         _) = self.fused_experts.workspace_shapes(a1, a1q, M, N, K, top_k,
-                                                  global_num_experts,
-                                                  local_num_experts)
+        (_, _, fused_out_shape, _) = self.fused_experts.workspace_shapes(
+            a1, a1q, M, N, K, top_k, global_num_experts, local_num_experts,
+            expert_tokens_meta)
         fused_out = torch.empty(fused_out_shape,
                                 device=a1q.device,
                                 dtype=a1.dtype)
@@ -614,8 +614,11 @@ class FusedMoEModularKernel(torch.nn.Module):
             need_expert_num_tokens_cpu = (
                 full_expert_tokens_meta.expert_num_tokens_cpu is not None)
             if need_expert_num_tokens_cpu:
+                # This is blocking as some implementations need the count
+                # on the CPU to determine appropriate input/out fused-moe
+                # buffers
                 c_expert_num_tokens_cpu = c_expert_num_tokens.to(
-                    "cpu", non_blocking=True)
+                    "cpu", non_blocking=False)
 
             return ExpertTokensMetadata(
                 expert_num_tokens=c_expert_num_tokens,

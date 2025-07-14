@@ -141,8 +141,6 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         a1q = hidden_states
         _, N, K = w1.size()
-        M, _ = output.size()
-        num_topk = topk_ids.size(1)
 
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
@@ -155,7 +153,6 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
                                   local_num_experts=local_num_experts,
                                   alignment=deep_gemm_block_shape()[0],
                                   expert_tokens_meta=expert_tokens_meta)
-        assert M_sum >= M * num_topk
 
         a1q_perm = _resize_cache(workspace2.view(dtype=torch.float8_e4m3fn),
                                  (M_sum, K))
@@ -189,7 +186,6 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         m_grouped_fp8_gemm_nt_contiguous((a2q, a2q_scale), (w2, w2_scale),
                                          mm2_out, expert_ids)
 
-        # TODO (varun) : We could probably reshape mm2_out and pass as output
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 

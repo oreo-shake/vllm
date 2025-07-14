@@ -111,11 +111,13 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
                                      or is_blackwell_deep_gemm_used()):
             assert self.deep_gemm_expert is not None
             return self.deep_gemm_expert.workspace_shapes(
-                a, aq, M, N, K, topk, global_num_experts, local_num_experts)
+                a, aq, M, N, K, topk, global_num_experts, local_num_experts,
+                expert_tokens_meta)
         else:
             return self.triton_expert.workspace_shapes(a, aq, M, N, K, topk,
                                                        global_num_experts,
-                                                       local_num_experts)
+                                                       local_num_experts,
+                                                       expert_tokens_meta)
 
     def apply(
         self,
