@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 import zmq
-import log
 
 from vllm import envs
 from vllm.config import VllmConfig
