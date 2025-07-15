@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 import zmq
+import log
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -218,6 +219,8 @@ class NixlConnectorScheduler:
             # prefill worker so that the remote blocks are freed.
             if all(p in params for p in ("remote_engine_id", "remote_host",
                                          "remote_port")):
+                logger.debug(
+                    "##[1] No remote prefill needed for request %s. ##", request.request_id)
                 self._reqs_need_recv[request.request_id] = (request, [])
 
         # No remote prefill for this request.
@@ -552,6 +555,7 @@ class NixlConnectorWorker:
         finished sets to Scheduler only once all ranks are done.
         """
         done_sending = self._get_new_notifs()
+        logger.debug("##[4]All done sending requests: %s##", done_sending)
         done_recving = self._pop_done_transfers(self._recving_transfers)
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
@@ -691,6 +695,10 @@ class NixlConnectorWorker:
         num_local_blocks = len(local_block_ids)
         if num_local_blocks == 0:
             agent_name = self._remote_agents[dst_engine_id]
+            logger.debug(
+                "## [3].Full prefix cache hit for request %s. "
+                "Notifying remote agent %s that no blocks need to be read. ## ",
+                request_id, agent_name)
             self.nixl_wrapper.send_notif(agent_name,
                                          notif_msg=request_id.encode("utf-8"))
             return

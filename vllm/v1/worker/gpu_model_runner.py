@@ -1163,6 +1163,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
+            logger.debug("##[5] All KV transfers finished: %s ##", finished_sending)
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1382,6 +1383,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # These transfers are designed to be async and the requests
             # involved may be disjoint from the running requests.
             # Do this here to save a collective_rpc.
+            logger.debug("##[2] Starting KV transfers %s ##", scheduler_output.kv_connector_metadata)
             kv_connector.start_load_kv(get_forward_context())
 
     @staticmethod
