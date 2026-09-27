@@ -1384,6 +1384,63 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
+def test_suffix_preserving_eviction():
+    """Freed requests lose their leading blocks first, and a returning request
+    reuses its cached suffix while only its evicted blocks are recomputed."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(0.5)
+    free_queue = manager.block_pool.free_block_queue
+
+    def run(req: Request, num_tokens: int) -> list[int]:
+        computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req)
+        assert num_computed_tokens == 0
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+        return manager.get_block_ids(req.request_id)[0]
+
+    prompt0 = list(range(4 * block_size))
+    req0 = make_request("0", prompt0, block_size, sha256)
+    req1 = make_request("1", list(range(100, 100 + 4 * block_size)), block_size, sha256)
+    assert run(req0, 4 * block_size) == [1, 2, 3, 4]
+    assert run(req1, 4 * block_size) == [5, 6, 7, 8]
+    manager.free(req0)
+    manager.free(req1)
+    # Never-used blocks, then the first half of each request, then the rest.
+    assert [b.block_id for b in free_queue.get_all_free_blocks()] == [
+        9, 10, 1, 2, 5, 6, 3, 4, 7, 8,
+    ]  # fmt: skip
+
+    # Evict the first half of req0.
+    filler = make_request(
+        "f", list(range(200, 200 + 4 * block_size)), block_size, sha256
+    )
+    assert run(filler, 4 * block_size) == [9, 10, 1, 2]
+
+    # req0 returns with more tokens: blocks 2-3 hit, blocks 0-1 form the gap.
+    req0b = make_request("0b", prompt0 + [7] * 10, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0b)
+    assert num_computed_tokens == 0
+    assert [b.block_id for b in computed_blocks.blocks[0]] == [0, 0, 3, 4]
+    assert manager.get_suffix_hit(computed_blocks, 0) == (2 * block_size, 64)
+    assert manager.allocate_slots(req0b, 2 * block_size, 0, computed_blocks)
+    # The gap gets new blocks; the suffix keeps its cached blocks.
+    assert manager.get_block_ids("0b")[0] == [5, 6, 3, 4]
+    for idx, block_id in enumerate([5, 6, 3, 4]):
+        cached = manager.block_pool.get_cached_block(req0b.block_hashes[idx], [0])
+        assert cached is not None and cached[0].block_id == block_id
+    assert manager.coordinator.single_type_managers[0].num_cached_block["0b"] == 4
+
+    # After skipping the suffix, allocation continues after the last block.
+    req0b.num_computed_tokens = 4 * block_size
+    new_blocks = manager.allocate_slots(req0b, 10)
+    assert new_blocks is not None and new_blocks.get_block_ids() == ([7],)
+
+
 def test_hash_block_correct_reuse():
     """
     This tests when a previously cached block is reused as a new block,

@@ -25,6 +25,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -484,6 +485,36 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_tiered_free_kv_cache_block_queue_evict_first_tier():
+    """Blocks in the evict-first tier are popped after never-used blocks and
+    before LRU blocks, regardless of the order in which they were freed."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(8)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:2])
+    queue.append_n([blocks[2], blocks[3]])
+    queue.append_n_evict_first([blocks[4], blocks[5]])
+    queue.prepend_n([blocks[6]])
+    queue.append_n_evict_first([blocks[7]])
+    assert queue.num_free_blocks == 8
+    expected = [6, 0, 1, 4, 5, 7, 2, 3]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Removing a block next to the tier boundary keeps both tiers linked.
+    queue.remove(blocks[7])
+    queue.remove(blocks[2])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [6, 0, 1, 4, 5, 3]
+
+    # Popping across the boundary skips it and keeps it usable.
+    assert [b.block_id for b in queue.popleft_n(5)] == [6, 0, 1, 4, 5]
+    assert queue.popleft() is blocks[3]
+    assert queue.num_free_blocks == 0
+    queue.append_n([blocks[0]])
+    queue.append_n_evict_first([blocks[1]])
+    assert [b.block_id for b in queue.popleft_n(2)] == [1, 0]
+    with pytest.raises(ValueError):
+        queue.popleft()
 
 
 def test_generate_block_hash_extra_keys():

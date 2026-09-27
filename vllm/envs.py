@@ -295,6 +295,8 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
+    VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
 
 
 def get_default_cache_root():
@@ -1115,6 +1117,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    # Evict the leading blocks of a freed request before any other cached
+    # block, and serve prefix-cache hits whose leading blocks were evicted by
+    # recomputing only the missing blocks. Requires prefix caching, a single
+    # full-attention KV cache group, no KV connector and no speculative
+    # decoding.
+    "VLLM_SUFFIX_PRESERVING_EVICTION": lambda: bool(
+        int(os.getenv("VLLM_SUFFIX_PRESERVING_EVICTION", "0"))
+    ),
+    # Fraction of a freed request's blocks, counted from its first block,
+    # that VLLM_SUFFIX_PRESERVING_EVICTION evicts first.
+    "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_PREFIX_FRACTION", "0.5")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
@@ -2173,6 +2188,8 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        "VLLM_SUFFIX_PRESERVING_EVICTION",
+        "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION",
     }
 
     from vllm.config.utils import normalize_value

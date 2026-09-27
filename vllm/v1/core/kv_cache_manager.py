@@ -9,9 +9,13 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    UnitaryKVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -183,6 +187,51 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Set by `enable_suffix_preserving_eviction`.
+        self._suffix_hit_manager: FullAttentionManager | None = None
+
+    def enable_suffix_preserving_eviction(self, prefix_evict_fraction: float) -> None:
+        """Evict the leading blocks of freed requests first, and let
+        `get_computed_blocks` return hits whose leading blocks were evicted.
+
+        Args:
+            prefix_evict_fraction: Fraction of a freed request's blocks,
+                counted from its first block, that are evicted first.
+        """
+        manager = self.coordinator.single_type_managers[0]
+        if (
+            not self.enable_caching
+            or not isinstance(self.coordinator, UnitaryKVCacheCoordinator)
+            or type(manager) is not FullAttentionManager
+        ):
+            raise ValueError(
+                "Suffix-preserving eviction requires prefix caching and a "
+                "single full-attention KV cache group."
+            )
+        self.block_pool.enable_prefix_first_eviction()
+        manager.enable_suffix_preserving_eviction(prefix_evict_fraction)
+        self._suffix_hit_manager = manager
+
+    def get_suffix_hit(
+        self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
+    ) -> tuple[int, int] | None:
+        """Get the gap end and suffix end, in tokens, of a suffix hit returned by
+        `get_computed_blocks`, or None if the hit has no suffix.
+
+        Tokens in [num_prefix_hit_tokens, gap_end) must be computed before
+        the request can skip to suffix_end.
+        """
+        if self._suffix_hit_manager is None:
+            return None
+        blocks = computed_blocks.blocks[0]
+        block_size = self._suffix_hit_manager.block_size
+        gap_end = num_prefix_hit_tokens // block_size
+        if len(blocks) <= gap_end:
+            return None
+        while blocks[gap_end].is_null:
+            gap_end += 1
+        return gap_end * block_size, len(blocks) * block_size
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -213,8 +262,11 @@ class KVCacheManager:
 
         Returns:
             A tuple containing:
-                - A list of blocks that are computed for the request.
-                - The number of computed tokens.
+                - A list of blocks that are computed for the request. With
+                  suffix-preserving eviction, the prefix hit may be followed by
+                  null blocks for a gap and then cached suffix blocks; see
+                  `get_suffix_hit`.
+                - The number of computed tokens, excluding any suffix hit.
                 - ``shared_prefix_boundary``: the block-aligned token position of
                   a shared prefix that a sparse-retention group (Mamba / sliding
                   window) has not cached yet (Marconi-style APC), or 0 if none.
@@ -269,11 +321,30 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
+        num_suffix_hit_tokens = 0
+        # Multimodal requests are excluded because encoder inputs are scheduled
+        # from a contiguous computed prefix.
+        if self._suffix_hit_manager is not None and not request.mm_features:
+            prefix_hit_blocks = computed_blocks[0]
+            suffix_hit = self._suffix_hit_manager.find_suffix_hit(
+                request.block_hashes, len(prefix_hit_blocks), max_cache_hit_length
+            )
+            if suffix_hit is not None:
+                suffix_start, suffix_blocks = suffix_hit
+                prefix_hit_blocks.extend(
+                    [self.block_pool.null_block]
+                    * (suffix_start - len(prefix_hit_blocks))
+                )
+                prefix_hit_blocks.extend(suffix_blocks)
+                num_suffix_hit_tokens = (
+                    len(suffix_blocks) * self._suffix_hit_manager.block_size
+                )
+
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
+                num_hits=num_new_computed_tokens + num_suffix_hit_tokens,
                 preempted=request.num_preemptions > 0,
             )
 

@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -738,6 +739,53 @@ class BlockPool:
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+
+    def enable_prefix_first_eviction(self) -> None:
+        """Switch the free queue to one with an evict-first tier used by
+        `free_blocks_prefix_first`. Must be called before any allocation."""
+        assert not isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        assert len(free_blocks) == self.num_gpu_blocks - 1, (
+            "prefix-first eviction must be enabled before any block is allocated"
+        )
+        for block in free_blocks:
+            block.prev_free_block = block.next_free_block = None
+        self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks)
+
+    def free_blocks_prefix_first(
+        self, blocks: Sequence[KVCacheBlock], num_evict_first: int
+    ) -> None:
+        """Free a request's blocks, given in token order, so that its leading
+        blocks are evicted before any other cached block.
+
+        Blocks at index < `num_evict_first` join the evict-first tier and the
+        rest join the LRU tail. Within each tier, earlier blocks are evicted
+        first, so the evicted region of a request grows from its first block
+        toward its last one.
+
+        Args:
+            blocks: The request's blocks in token order.
+            num_evict_first: The number of leading blocks for the evict-first
+                tier.
+        """
+        assert isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
+        evict_first: list[KVCacheBlock] = []
+        evict_later: list[KVCacheBlock] = []
+        blocks_without_hash: list[KVCacheBlock] = []
+        for idx, block in enumerate(blocks):
+            block.ref_cnt -= 1
+            if block.ref_cnt != 0 or block.is_null:
+                continue
+            if block.block_hash is None:
+                blocks_without_hash.append(block)
+            elif idx < num_evict_first:
+                evict_first.append(block)
+            else:
+                evict_later.append(block)
+
+        self.free_block_queue.prepend_n(blocks_without_hash)
+        self.free_block_queue.append_n_evict_first(evict_first)
+        self.free_block_queue.append_n(evict_later)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

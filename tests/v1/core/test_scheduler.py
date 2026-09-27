@@ -5383,3 +5383,70 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_suffix_preserving_eviction_skips_cached_suffix(monkeypatch):
+    """A request whose leading blocks were evicted computes only those blocks,
+    then resumes after its cached suffix."""
+    monkeypatch.setenv("VLLM_SUFFIX_PRESERVING_EVICTION", "1")
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, num_blocks=11, block_size=block_size
+    )
+    init_none_hash(sha256)
+    block_hasher = get_request_block_hasher(block_size, sha256)
+
+    def make_request(req_id: str, prompt: list[int]) -> Request:
+        return Request(
+            request_id=req_id,
+            prompt_token_ids=prompt,
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            block_hasher=block_hasher,
+        )
+
+    def step(req: Request, num_tokens: int, sampled: list[int]) -> SchedulerOutput:
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {req.request_id: num_tokens}
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[req.request_id],
+                req_id_to_index={req.request_id: 0},
+                sampled_token_ids=[sampled],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return output
+
+    prompt0 = list(range(4 * block_size))
+    for req_id, prompt in [
+        ("0", prompt0),
+        ("1", list(range(100, 100 + 4 * block_size))),
+        # Evicts the first half of request 0.
+        ("filler", list(range(200, 200 + 4 * block_size))),
+    ]:
+        req = make_request(req_id, prompt)
+        scheduler.add_request(req)
+        step(req, len(prompt), [1])
+        assert req.is_finished()
+
+    scheduler.scheduler_config.long_prefill_token_threshold = 24
+    req = make_request("0b", prompt0 + [7] * 10)
+    scheduler.add_request(req)
+
+    # The two evicted blocks are recomputed in two chunks.
+    step(req, 24, [])
+    assert req.prefill_stats is not None
+    assert req.prefill_stats.num_cached_tokens == 2 * block_size
+    assert req.num_computed_tokens == 24
+    step(req, 8, [])
+    assert req.num_computed_tokens == 4 * block_size
+    assert scheduler.kv_cache_manager.get_block_ids("0b") == ([5, 6, 3, 4],)
+
+    # The cached suffix is skipped.
+    output = step(req, 10, [1])
+    assert output.scheduled_cached_reqs.num_computed_tokens == [4 * block_size]
+    assert req.is_finished()
