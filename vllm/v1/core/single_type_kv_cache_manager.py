@@ -659,12 +659,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         super().__init__(*args, **kwargs)
         # Set by `enable_suffix_preserving_eviction`.
         self._prefix_evict_fraction: float | None = None
+        self._first_tier_len = 0
+        self._tier_len = 0
         # {req_id: (gap_end_block, suffix_end_block)} for requests admitted
         # with a suffix hit whose gap blocks are not all cached yet.
         self._suffix_hit_reqs: dict[str, tuple[int, int]] = {}
 
-    def enable_suffix_preserving_eviction(self, prefix_evict_fraction: float) -> None:
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float,
+        first_tier_len: int = 0,
+        tier_len: int = 0,
+    ) -> None:
         """Free requests prefix-first and accept suffix hits.
+
+        With `first_tier_len` == 0, the leading `prefix_evict_fraction` of a
+        freed request's blocks form evict-first tier 0. Otherwise its first
+        `first_tier_len` blocks form tier 0 and each following run of
+        `tier_len` blocks the next tier; see `BlockPool.free_blocks_tiered`.
 
         A suffix hit is passed to `add_local_computed_blocks` as the prefix
         hit, then one null block per missing block (the gap), then the cached
@@ -674,7 +686,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         assert self.block_size == self.block_pool.hash_block_size
         assert self.dcp_world_size == 1 and self.pcp_world_size == 1
         assert 0.0 <= prefix_evict_fraction <= 1.0
+        assert first_tier_len >= 0 and tier_len >= 0
         self._prefix_evict_fraction = prefix_evict_fraction
+        self._first_tier_len = first_tier_len
+        self._tier_len = tier_len
 
     def find_suffix_hit(
         self,
@@ -786,9 +801,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             super().free(request_id)
             return
         blocks = self.pop_blocks_for_free(request_id)
-        self.block_pool.free_blocks_prefix_first(
-            blocks, int(len(blocks) * self._prefix_evict_fraction)
+        first_tier_len = self._first_tier_len or int(
+            len(blocks) * self._prefix_evict_fraction
         )
+        self.block_pool.free_blocks_tiered(blocks, first_tier_len, self._tier_len)
 
     @classmethod
     def find_longest_cache_hit(

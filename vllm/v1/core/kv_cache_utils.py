@@ -427,25 +427,38 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
 
 
-class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
-    """Free block queue with an evict-first tier ahead of the LRU tier.
+_TIER_BOUNDARY_BLOCK_ID = -2
 
-    A boundary node splits the list: blocks before it are evicted before any
-    block after it. `prepend_n` and `append_n` keep their meaning; blocks passed
-    to `append_n_evict_first` join the end of the evict-first tier. The
-    boundary starts at the tail, so blocks that were never allocated are
-    evicted before the evict-first tier.
+
+class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
+    """Free block queue with ordered evict-first tiers ahead of the LRU tier.
+
+    Boundary nodes split the list into `num_tiers` evict-first tiers followed
+    by the LRU tier: every block of tier i is evicted before any block of tier
+    i + 1, and the last evict-first tier before the LRU tier. `prepend_n` and
+    `append_n` keep their meaning; blocks passed to `append_n_to_tier` join the
+    end of that tier. The boundaries start at the tail, so blocks that were
+    never allocated are evicted before tier 0.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(self, blocks: list[KVCacheBlock], num_tiers: int = 1) -> None:
+        assert num_tiers >= 1
         super().__init__(blocks)
-        self._boundary = KVCacheBlock(block_id=-1)
-        last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None
-        last_block.next_free_block = self._boundary
-        self._boundary.prev_free_block = last_block
-        self._boundary.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = self._boundary
+        self._boundaries = [
+            KVCacheBlock(block_id=_TIER_BOUNDARY_BLOCK_ID) for _ in range(num_tiers)
+        ]
+        prev_block = self.fake_free_list_tail.prev_free_block
+        assert prev_block is not None
+        for boundary in self._boundaries:
+            prev_block.next_free_block = boundary
+            boundary.prev_free_block = prev_block
+            prev_block = boundary
+        prev_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = prev_block
+
+    @property
+    def num_tiers(self) -> int:
+        return len(self._boundaries)
 
     def popleft(self) -> KVCacheBlock:
         if self.num_free_blocks == 0:
@@ -458,14 +471,13 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
 
-        boundary = self._boundary
-        passed_boundary = False
+        passed_boundaries: list[KVCacheBlock] = []
         curr_block = self.fake_free_list_head.next_free_block
         ret = []
         while len(ret) < n:
             assert curr_block is not None
-            if curr_block is boundary:
-                passed_boundary = True
+            if curr_block.block_id == _TIER_BOUNDARY_BLOCK_ID:
+                passed_boundaries.append(curr_block)
                 curr_block = curr_block.next_free_block
                 continue
             ret.append(curr_block)
@@ -475,34 +487,34 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             curr_block = next_block
 
         assert curr_block is not None
-        first_block = curr_block
-        if passed_boundary:
-            boundary.next_free_block = curr_block
-            curr_block.prev_free_block = boundary
-            first_block = boundary
-        self.fake_free_list_head.next_free_block = first_block
-        first_block.prev_free_block = self.fake_free_list_head
+        # Relink the passed boundaries, now empty tiers, ahead of curr_block.
+        prev_block = self.fake_free_list_head
+        for block in [*passed_boundaries, curr_block]:
+            prev_block.next_free_block = block
+            block.prev_free_block = prev_block
+            prev_block = block
         return ret
 
-    def append_n_evict_first(self, blocks: list[KVCacheBlock]) -> None:
-        """Append blocks to the end of the evict-first tier."""
+    def append_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        """Append blocks to the end of an evict-first tier."""
         if len(blocks) == 0:
             return
-        prev_block = self._boundary.prev_free_block
+        boundary = self._boundaries[tier]
+        prev_block = boundary.prev_free_block
         assert prev_block is not None
         for block in blocks:
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
             prev_block = block
-        prev_block.next_free_block = self._boundary
-        self._boundary.prev_free_block = prev_block
+        prev_block.next_free_block = boundary
+        boundary.prev_free_block = prev_block
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         return [
             block
             for block in super().get_all_free_blocks()
-            if block is not self._boundary
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID
         ]
 
     def iter_blocks_after(
@@ -510,7 +522,7 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         cursor: KVCacheBlock | None,
     ) -> Iterator[KVCacheBlock]:
         for block in super().iter_blocks_after(cursor):
-            if block is not self._boundary:
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID:
                 yield block
 
 

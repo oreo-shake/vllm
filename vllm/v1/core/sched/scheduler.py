@@ -1264,10 +1264,25 @@ class Scheduler(SchedulerInterface):
                 "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION must be in [0, 1], "
                 f"got {fraction}"
             )
-        self.kv_cache_manager.enable_suffix_preserving_eviction(fraction)
-        logger.info(
-            "Suffix-preserving eviction enabled with prefix fraction %.2f.", fraction
+        tier_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_TOKENS
+        step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
+        if tier_tokens < 0 or step_tokens < 0:
+            raise ValueError("Suffix eviction tier sizes must not be negative")
+        self.kv_cache_manager.enable_suffix_preserving_eviction(
+            fraction, tier_tokens, step_tokens
         )
+        if tier_tokens:
+            logger.info(
+                "Suffix-preserving eviction enabled with eviction tiers of %d "
+                "tokens, then steps of %d tokens.",
+                tier_tokens,
+                step_tokens or tier_tokens,
+            )
+        else:
+            logger.info(
+                "Suffix-preserving eviction enabled with prefix fraction %.2f.",
+                fraction,
+            )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

@@ -740,9 +740,9 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
-    def enable_prefix_first_eviction(self) -> None:
-        """Switch the free queue to one with an evict-first tier used by
-        `free_blocks_prefix_first`. Must be called before any allocation."""
+    def enable_prefix_first_eviction(self, num_tiers: int = 1) -> None:
+        """Switch the free queue to one with `num_tiers` evict-first tiers used
+        by `free_blocks_tiered`. Must be called before any allocation."""
         assert not isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
         free_blocks = self.free_block_queue.get_all_free_blocks()
         assert len(free_blocks) == self.num_gpu_blocks - 1, (
@@ -750,27 +750,33 @@ class BlockPool:
         )
         for block in free_blocks:
             block.prev_free_block = block.next_free_block = None
-        self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks)
+        self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
 
-    def free_blocks_prefix_first(
-        self, blocks: Sequence[KVCacheBlock], num_evict_first: int
+    def free_blocks_tiered(
+        self,
+        blocks: Sequence[KVCacheBlock],
+        first_tier_len: int,
+        tier_len: int = 0,
     ) -> None:
-        """Free a request's blocks, given in token order, so that its leading
-        blocks are evicted before any other cached block.
+        """Free a request's blocks, given in token order, into the evict-first
+        tiers by block position.
 
-        Blocks at index < `num_evict_first` join the evict-first tier and the
-        rest join the LRU tail. Within each tier, earlier blocks are evicted
-        first, so the evicted region of a request grows from its first block
-        toward its last one.
+        Blocks at index < `first_tier_len` join tier 0. With `tier_len` > 0,
+        each following run of `tier_len` blocks joins the next tier and blocks
+        past the last tier join the LRU tail; with `tier_len` == 0 all of them
+        join the LRU tail. Within each tier, earlier blocks are evicted first,
+        so the evicted region of a request grows from its first block toward
+        its last one.
 
         Args:
             blocks: The request's blocks in token order.
-            num_evict_first: The number of leading blocks for the evict-first
-                tier.
+            first_tier_len: The number of leading blocks for tier 0.
+            tier_len: The number of blocks per tier after tier 0.
         """
-        assert isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
-        evict_first: list[KVCacheBlock] = []
-        evict_later: list[KVCacheBlock] = []
+        queue = self.free_block_queue
+        assert isinstance(queue, TieredFreeKVCacheBlockQueue)
+        num_tiers = queue.num_tiers
+        tiers: list[list[KVCacheBlock]] = [[] for _ in range(num_tiers + 1)]
         blocks_without_hash: list[KVCacheBlock] = []
         for idx, block in enumerate(blocks):
             block.ref_cnt -= 1
@@ -778,14 +784,18 @@ class BlockPool:
                 continue
             if block.block_hash is None:
                 blocks_without_hash.append(block)
-            elif idx < num_evict_first:
-                evict_first.append(block)
+            elif idx < first_tier_len:
+                tiers[0].append(block)
+            elif tier_len > 0:
+                tier = 1 + (idx - first_tier_len) // tier_len
+                tiers[min(tier, num_tiers)].append(block)
             else:
-                evict_later.append(block)
+                tiers[num_tiers].append(block)
 
-        self.free_block_queue.prepend_n(blocks_without_hash)
-        self.free_block_queue.append_n_evict_first(evict_first)
-        self.free_block_queue.append_n(evict_later)
+        queue.prepend_n(blocks_without_hash)
+        for tier in range(num_tiers):
+            queue.append_n_to_tier(tiers[tier], tier)
+        queue.append_n(tiers[num_tiers])
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

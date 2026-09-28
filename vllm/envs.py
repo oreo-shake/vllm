@@ -297,6 +297,8 @@ if TYPE_CHECKING:
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
     VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
+    VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
 
 
 def get_default_cache_root():
@@ -1130,6 +1132,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # that VLLM_SUFFIX_PRESERVING_EVICTION evicts first.
     "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION": lambda: float(
         os.getenv("VLLM_SUFFIX_EVICTION_PREFIX_FRACTION", "0.5")
+    ),
+    # When > 0, replaces the prefix fraction: the first this many tokens of
+    # every freed request are evicted before any other cached token, so small
+    # eviction demand falls on one request. Larger demand then grows every
+    # freed request's evicted region in steps of
+    # VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS (default: the same size).
+    "VLLM_SUFFIX_EVICTION_TIER_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_TOKENS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", "0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
@@ -2190,6 +2203,8 @@ def compile_factors() -> dict[str, object]:
         "NO_COLOR",
         "VLLM_SUFFIX_PRESERVING_EVICTION",
         "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION",
+        "VLLM_SUFFIX_EVICTION_TIER_TOKENS",
+        "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
     }
 
     from vllm.config.utils import normalize_value

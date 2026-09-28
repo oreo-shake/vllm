@@ -493,9 +493,9 @@ def test_tiered_free_kv_cache_block_queue_evict_first_tier():
     blocks = [KVCacheBlock(block_id=i) for i in range(8)]
     queue = TieredFreeKVCacheBlockQueue(blocks[:2])
     queue.append_n([blocks[2], blocks[3]])
-    queue.append_n_evict_first([blocks[4], blocks[5]])
+    queue.append_n_to_tier([blocks[4], blocks[5]], 0)
     queue.prepend_n([blocks[6]])
-    queue.append_n_evict_first([blocks[7]])
+    queue.append_n_to_tier([blocks[7]], 0)
     assert queue.num_free_blocks == 8
     expected = [6, 0, 1, 4, 5, 7, 2, 3]
     assert [b.block_id for b in queue.get_all_free_blocks()] == expected
@@ -511,8 +511,36 @@ def test_tiered_free_kv_cache_block_queue_evict_first_tier():
     assert queue.popleft() is blocks[3]
     assert queue.num_free_blocks == 0
     queue.append_n([blocks[0]])
-    queue.append_n_evict_first([blocks[1]])
+    queue.append_n_to_tier([blocks[1]], 0)
     assert [b.block_id for b in queue.popleft_n(2)] == [1, 0]
+    with pytest.raises(ValueError):
+        queue.popleft()
+
+
+def test_tiered_free_kv_cache_block_queue_multiple_tiers():
+    """Tiers are popped in order, each after the never-used blocks and before
+    the LRU tail, and popping across empty tiers keeps them usable."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(10)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=3)
+    queue.append_n([blocks[1]])
+    queue.append_n_to_tier([blocks[2], blocks[3]], 2)
+    queue.append_n_to_tier([blocks[4]], 0)
+    queue.append_n_to_tier([blocks[5]], 1)
+    queue.append_n_to_tier([blocks[6]], 0)
+    expected = [0, 4, 6, 5, 2, 3, 1]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Pop through tier 0 and tier 1 into tier 2, then refill the emptied tiers.
+    assert [b.block_id for b in queue.popleft_n(5)] == [0, 4, 6, 5, 2]
+    queue.append_n_to_tier([blocks[7]], 1)
+    queue.append_n_to_tier([blocks[8]], 0)
+    queue.append_n_to_tier([blocks[9]], 2)
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [8, 7, 3, 9, 1]
+
+    queue.remove(blocks[7])
+    assert [b.block_id for b in queue.popleft_n(4)] == [8, 3, 9, 1]
+    assert queue.num_free_blocks == 0
     with pytest.raises(ValueError):
         queue.popleft()
 

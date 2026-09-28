@@ -1441,6 +1441,68 @@ def test_suffix_preserving_eviction():
     assert new_blocks is not None and new_blocks.get_block_ids() == ([7],)
 
 
+@pytest.mark.parametrize(
+    "first_tier_blocks,tier_blocks,demand,expected",
+    [
+        # Demand within one tier falls on the oldest freed request only.
+        (7, 7, 5, [5, 0, 0]),
+        # Filling tier 0 takes the same number of blocks from every request.
+        (7, 7, 21, [7, 7, 7]),
+        # Past tier 0, the next tier is shared in the same order.
+        (7, 7, 30, [14, 9, 7]),
+        # Steps smaller than tier 0 spread the remainder more finely.
+        (7, 2, 26, [9, 9, 8]),
+        # One tier covering whole requests evicts them one at a time.
+        (512, 512, 21, [18, 3, 0]),
+    ],
+)
+def test_suffix_preserving_eviction_tiers(
+    first_tier_blocks: int, tier_blocks: int, demand: int, expected: list[int]
+):
+    """Eviction demand is taken from the leading blocks of freed requests in
+    tiers, so each request loses a leading run of blocks."""
+    block_size = 16
+    lengths = [18, 21, 24]
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 1 + sum(lengths)),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(
+        0.5, first_tier_blocks * block_size, tier_blocks * block_size
+    )
+
+    def run(req: Request, num_tokens: int) -> None:
+        computed_blocks, _, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+
+    sessions = []
+    for i, num_blocks in enumerate(lengths):
+        prompt = list(range(1000 * i, 1000 * i + num_blocks * block_size))
+        req = make_request(str(i), prompt, block_size, sha256)
+        run(req, num_blocks * block_size)
+        sessions.append(req)
+    for req in sessions:
+        manager.free(req)
+
+    filler = make_request(
+        "f", list(range(10**5, 10**5 + demand * block_size)), block_size, sha256
+    )
+    run(filler, demand * block_size)
+
+    evicted = []
+    for req in sessions:
+        cached = [
+            manager.block_pool.get_cached_block(h, [0]) is not None
+            for h in req.block_hashes
+        ]
+        num_evicted = cached.index(True) if True in cached else len(cached)
+        assert all(cached[num_evicted:])
+        evicted.append(num_evicted)
+    assert evicted == expected
+
+
 def test_hash_block_correct_reuse():
     """
     This tests when a previously cached block is reused as a new block,

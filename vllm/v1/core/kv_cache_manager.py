@@ -190,13 +190,24 @@ class KVCacheManager:
         # Set by `enable_suffix_preserving_eviction`.
         self._suffix_hit_manager: FullAttentionManager | None = None
 
-    def enable_suffix_preserving_eviction(self, prefix_evict_fraction: float) -> None:
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float,
+        first_tier_tokens: int = 0,
+        tier_tokens: int = 0,
+    ) -> None:
         """Evict the leading blocks of freed requests first, and let
         `get_computed_blocks` return hits whose leading blocks were evicted.
 
         Args:
             prefix_evict_fraction: Fraction of a freed request's blocks,
-                counted from its first block, that are evicted first.
+                counted from its first block, that are evicted first. Used
+                when `first_tier_tokens` is 0.
+            first_tier_tokens: Leading tokens of every freed request that are
+                evicted before any other cached token.
+            tier_tokens: Size of each following eviction tier, so that the
+                evicted region grows across requests in steps of this many
+                tokens. Defaults to `first_tier_tokens`.
         """
         manager = self.coordinator.single_type_managers[0]
         if (
@@ -208,8 +219,22 @@ class KVCacheManager:
                 "Suffix-preserving eviction requires prefix caching and a "
                 "single full-attention KV cache group."
             )
-        self.block_pool.enable_prefix_first_eviction()
-        manager.enable_suffix_preserving_eviction(prefix_evict_fraction)
+        block_size = manager.block_size
+        first_tier_len = first_tier_tokens // block_size
+        tier_len = (tier_tokens or first_tier_tokens) // block_size
+        if first_tier_tokens and (first_tier_len == 0 or tier_len == 0):
+            raise ValueError(
+                f"Suffix eviction tier sizes must be at least one block "
+                f"({block_size} tokens)."
+            )
+        num_tiers = 1
+        if first_tier_len:
+            max_num_blocks = cdiv(self.max_model_len, block_size)
+            num_tiers += max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
+        self.block_pool.enable_prefix_first_eviction(num_tiers)
+        manager.enable_suffix_preserving_eviction(
+            prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
+        )
         self._suffix_hit_manager = manager
 
     def get_suffix_hit(
