@@ -545,6 +545,36 @@ def test_tiered_free_kv_cache_block_queue_multiple_tiers():
         queue.popleft()
 
 
+def test_tiered_free_kv_cache_block_queue_demote_idle():
+    """Idle-TTL demotion moves expired later-tier / LRU blocks into tier 0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=2)
+    # never=0, tier0=1, tier1=2,3, LRU=4,5
+    blocks[1].freed_at = 100.0
+    blocks[2].freed_at = 100.0
+    blocks[3].freed_at = 200.0
+    blocks[4].freed_at = 100.0
+    blocks[5].freed_at = 200.0
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n_to_tier([blocks[2], blocks[3]], 1)
+    queue.append_n([blocks[4], blocks[5]])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 1, 2, 3, 4, 5]
+
+    # TTL=50 at now=160: expire 1,2,4 (freed_at=100); keep 3,5 (200).
+    n = queue.demote_idle(50.0, now=160.0)
+    assert n == 3
+    # never=0, then demoted into tier0 (1,2,4) after original tier0 empty of
+    # non-expired, then remaining tier1=3, LRU=5. Original tier0 block 1 was
+    # also expired and re-appended to tier0 with the others.
+    got = [b.block_id for b in queue.get_all_free_blocks()]
+    assert got[0] == 0
+    assert set(got[1:4]) == {1, 2, 4}
+    assert got[4:] == [3, 5]
+    # Expired blocks are popped before non-expired later-tier content.
+    assert [b.block_id for b in queue.popleft_n(4)] == got[:4]
+    assert [b.block_id for b in queue.popleft_n(2)] == [3, 5]
+
+
 def test_generate_block_hash_extra_keys():
     request = make_request(
         request_id="0",

@@ -299,6 +299,8 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
     VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
     VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
+    VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
 
 
 def get_default_cache_root():
@@ -1143,6 +1145,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS": lambda: int(
         os.getenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", "0")
+    ),
+    # Cap on the number of position eviction tiers. 0 = uncapped (one tier per
+    # step across max_model_len). When set, blocks past the last tier join the
+    # LRU tail so deep context stays recency-governed.
+    "VLLM_SUFFIX_EVICTION_MAX_TIERS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_MAX_TIERS", "0")
+    ),
+    # Seconds a freed cached block may sit idle before demotion into tier 0.
+    # 0 disables. Reclaims finished / long-idle sessions ahead of fresher
+    # later-tier content.
+    "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
@@ -2205,6 +2219,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION",
         "VLLM_SUFFIX_EVICTION_TIER_TOKENS",
         "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
+        "VLLM_SUFFIX_EVICTION_MAX_TIERS",
+        "VLLM_SUFFIX_EVICTION_IDLE_TTL_S",
     }
 
     from vllm.config.utils import normalize_value

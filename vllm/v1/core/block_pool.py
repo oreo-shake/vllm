@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -659,6 +660,15 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        ttl_s = getattr(self, "_suffix_idle_ttl_s", 0.0) or 0.0
+        queue = self.free_block_queue
+        if (
+            ttl_s > 0
+            and isinstance(queue, TieredFreeKVCacheBlockQueue)
+        ):
+            time_fn = getattr(self, "_time_fn", time.monotonic)
+            queue.demote_idle(ttl_s, now=time_fn())
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -667,12 +677,14 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -740,7 +752,9 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
-    def enable_prefix_first_eviction(self, num_tiers: int = 1) -> None:
+    def enable_prefix_first_eviction(
+        self, num_tiers: int = 1, idle_ttl_s: float = 0.0
+    ) -> None:
         """Switch the free queue to one with `num_tiers` evict-first tiers used
         by `free_blocks_tiered`. Must be called before any allocation."""
         assert not isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
@@ -750,7 +764,12 @@ class BlockPool:
         )
         for block in free_blocks:
             block.prev_free_block = block.next_free_block = None
+            block.freed_at = None
         self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
+        self._suffix_idle_ttl_s = idle_ttl_s
+        # Overridable clock for tests / CPU simulator (defaults to wall time).
+        if not hasattr(self, "_time_fn"):
+            self._time_fn = time.monotonic
 
     def free_blocks_tiered(
         self,
@@ -778,6 +797,8 @@ class BlockPool:
         num_tiers = queue.num_tiers
         tiers: list[list[KVCacheBlock]] = [[] for _ in range(num_tiers + 1)]
         blocks_without_hash: list[KVCacheBlock] = []
+        time_fn = getattr(self, "_time_fn", time.monotonic)
+        now = time_fn()
         for idx, block in enumerate(blocks):
             block.ref_cnt -= 1
             if block.ref_cnt != 0 or block.is_null:
@@ -785,11 +806,14 @@ class BlockPool:
             if block.block_hash is None:
                 blocks_without_hash.append(block)
             elif idx < first_tier_len:
+                block.freed_at = now
                 tiers[0].append(block)
             elif tier_len > 0:
                 tier = 1 + (idx - first_tier_len) // tier_len
+                block.freed_at = now
                 tiers[min(tier, num_tiers)].append(block)
             else:
+                block.freed_at = now
                 tiers[num_tiers].append(block)
 
         queue.prepend_n(blocks_without_hash)

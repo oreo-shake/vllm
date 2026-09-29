@@ -1266,22 +1266,32 @@ class Scheduler(SchedulerInterface):
             )
         tier_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_TOKENS
         step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
+        max_tiers = envs.VLLM_SUFFIX_EVICTION_MAX_TIERS
+        idle_ttl_s = envs.VLLM_SUFFIX_EVICTION_IDLE_TTL_S
         if tier_tokens < 0 or step_tokens < 0:
             raise ValueError("Suffix eviction tier sizes must not be negative")
+        if max_tiers < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_MAX_TIERS must not be negative")
+        if idle_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
         self.kv_cache_manager.enable_suffix_preserving_eviction(
-            fraction, tier_tokens, step_tokens
+            fraction, tier_tokens, step_tokens, max_tiers, idle_ttl_s
         )
         if tier_tokens:
             logger.info(
                 "Suffix-preserving eviction enabled with eviction tiers of %d "
-                "tokens, then steps of %d tokens.",
+                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s).",
                 tier_tokens,
                 step_tokens or tier_tokens,
+                max_tiers or "uncapped",
+                idle_ttl_s or "off",
             )
         else:
             logger.info(
-                "Suffix-preserving eviction enabled with prefix fraction %.2f.",
+                "Suffix-preserving eviction enabled with prefix fraction %.2f "
+                "(idle_ttl_s=%s).",
                 fraction,
+                idle_ttl_s or "off",
             )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

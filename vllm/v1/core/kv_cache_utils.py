@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -136,6 +137,10 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Monotonic time when this block last entered the free queue as a cached
+    # (hashed) block. None for never-allocated blocks. Used by idle-TTL
+    # demotion under suffix-preserving eviction.
+    freed_at: float | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -509,6 +514,30 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         prev_block.next_free_block = boundary
         boundary.prev_free_block = prev_block
         self.num_free_blocks += len(blocks)
+
+    def demote_idle(self, ttl_s: float, now: float | None = None) -> int:
+        """Move free blocks idle for at least `ttl_s` into tier 0.
+
+        Never-allocated blocks (`freed_at is None`) are left alone. Expired
+        cached blocks from later tiers or the LRU tail are removed and
+        appended to tier 0 so they are reclaimed before any non-expired
+        later-tier content. Returns the number of demoted blocks.
+        """
+        if ttl_s <= 0:
+            return 0
+        if now is None:
+            now = time.monotonic()
+        expired = [
+            block
+            for block in self.get_all_free_blocks()
+            if block.freed_at is not None and now - block.freed_at >= ttl_s
+        ]
+        if not expired:
+            return 0
+        for block in expired:
+            self.remove(block)
+        self.append_n_to_tier(expired, 0)
+        return len(expired)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         return [
