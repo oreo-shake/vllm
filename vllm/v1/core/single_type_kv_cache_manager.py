@@ -493,12 +493,13 @@ class SingleTypeKVCacheManager(ABC):
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, session_id: str | None = None) -> None:
         """
         Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            session_id: Optional conversation id for session-aware eviction.
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
@@ -796,15 +797,17 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         self._suffix_hit_reqs.pop(request_id, None)
         return super().pop_blocks_for_free(request_id)
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, session_id: str | None = None) -> None:
         if self._prefix_evict_fraction is None:
-            super().free(request_id)
+            super().free(request_id, session_id=session_id)
             return
         blocks = self.pop_blocks_for_free(request_id)
         first_tier_len = self._first_tier_len or int(
             len(blocks) * self._prefix_evict_fraction
         )
-        self.block_pool.free_blocks_tiered(blocks, first_tier_len, self._tier_len)
+        self.block_pool.free_blocks_tiered(
+            blocks, first_tier_len, self._tier_len, session_id=session_id
+        )
 
     @classmethod
     def find_longest_cache_hit(

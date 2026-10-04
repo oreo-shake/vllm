@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -197,6 +198,15 @@ class KVCacheManager:
         tier_tokens: int = 0,
         max_tiers: int = 0,
         idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+        idle_demote: str = "all",
+        idle_protect_tokens: int = 0,
     ) -> None:
         """Evict the leading blocks of freed requests first, and let
         `get_computed_blocks` return hits whose leading blocks were evicted.
@@ -217,6 +227,24 @@ class KVCacheManager:
                 are demoted into tier 0 before the next allocation, so finished
                 or long-idle sessions are reclaimed ahead of fresher later-tier
                 content.
+            session_dead_ttl_s: When > 0, enable session-aware full eviction.
+                A session idle past the detector threshold has all of its
+                remaining unique blocks promoted for eviction.
+            session_ewa_alpha: Smoothing for the per-session think-time EWA.
+            session_dead_k: For detector=ewa, dead if idle >=
+                max(floor, ewa + k * std).
+            session_min_gaps: Gaps required before the adaptive / quantile
+                threshold; fewer uses the static floor only.
+            session_detector: ``ewa`` (per-session) or ``global`` (server-wide
+                think-time quantile).
+            session_quantile: Quantile for detector=global (e.g. 0.95).
+            session_gap_window: Recent think times kept for the global
+                quantile.
+            idle_demote: ``all`` dumps expired unique KV to tier 0 (historical).
+                ``protect`` skips the last ``idle_protect_tokens``. ``step``
+                ages one tier per TTL (also honors protect).
+            idle_protect_tokens: Last this many tokens of a freed request are
+                never idle-demoted. 0 disables. Session-dead wipe still can.
         """
         manager = self.coordinator.single_type_managers[0]
         if (
@@ -245,11 +273,49 @@ class KVCacheManager:
             max_num_blocks = cdiv(self.max_model_len, block_size)
             full_tiers = 1 + max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
             num_tiers = min(full_tiers, max_tiers) if max_tiers > 0 else full_tiers
-        self.block_pool.enable_prefix_first_eviction(num_tiers, idle_ttl_s)
+        if session_dead_ttl_s < 0:
+            raise ValueError(
+                f"session_dead_ttl_s must be >= 0, got {session_dead_ttl_s}"
+            )
+        if session_detector not in ("ewa", "global"):
+            raise ValueError(
+                f"session_detector must be 'ewa' or 'global', got {session_detector}"
+            )
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "idle_demote must be 'all', 'protect', or 'step', "
+                f"got {idle_demote}"
+            )
+        if idle_protect_tokens < 0:
+            raise ValueError(
+                f"idle_protect_tokens must be >= 0, got {idle_protect_tokens}"
+            )
+        idle_protect_len = idle_protect_tokens // block_size
+        self.block_pool.enable_prefix_first_eviction(
+            num_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+            idle_demote=idle_demote,
+            idle_protect_len=idle_protect_len,
+        )
         manager.enable_suffix_preserving_eviction(
             prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
         )
         self._suffix_hit_manager = manager
+
+    def note_session_arrival(self, request: Request) -> None:
+        tracker = self.block_pool.session_tracker
+        if not tracker.enabled:
+            return
+        tracker.on_arrival(
+            request.session_id, getattr(self.block_pool, "_time_fn", time.monotonic)()
+        )
 
     def get_suffix_hit(
         self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
@@ -621,7 +687,13 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        tracker = self.block_pool.session_tracker
+        if tracker.enabled:
+            tracker.on_finish(
+                request.session_id,
+                getattr(self.block_pool, "_time_fn", time.monotonic)(),
+            )
+        self.coordinator.free(request.request_id, session_id=request.session_id)
 
     def remove_skipped_blocks(
         self,

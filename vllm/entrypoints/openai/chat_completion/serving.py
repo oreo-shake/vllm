@@ -14,6 +14,7 @@ import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.v1.core.session_liveness import resolve_session_id
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -325,6 +326,15 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                session_id = resolve_session_id(
+                    body_session_id=request.session_id,
+                    headers=None if raw_request is None else raw_request.headers,
+                    extra_args=sampling_params.extra_args,
+                )
+                if session_id:
+                    extra = dict(sampling_params.extra_args or {})
+                    extra["session_id"] = session_id
+                    sampling_params.extra_args = extra
 
             self._log_inputs(
                 sub_request_id,

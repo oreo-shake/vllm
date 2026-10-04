@@ -367,6 +367,15 @@ class InputProcessor:
                     )
                 )
 
+        session_id = None
+        extra_args = (
+            sampling_params.extra_args if sampling_params is not None else None
+        )
+        if extra_args is not None:
+            extra_sid = extra_args.get("session_id")
+            if isinstance(extra_sid, str) and extra_sid:
+                session_id = extra_sid
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -382,6 +391,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            session_id=session_id,
         )
 
     def _validate_prompt_len(

@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
 )
+from vllm.v1.core.session_liveness import SessionLivenessTracker
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -196,6 +197,11 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.session_tracker = SessionLivenessTracker()
+        self._suffix_idle_ttl_s = 0.0
+        self._suffix_idle_demote = "all"
+        self._suffix_idle_protect_len = 0
+        self._time_fn = time.monotonic
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -662,12 +668,16 @@ class BlockPool:
 
         ttl_s = getattr(self, "_suffix_idle_ttl_s", 0.0) or 0.0
         queue = self.free_block_queue
-        if (
-            ttl_s > 0
-            and isinstance(queue, TieredFreeKVCacheBlockQueue)
-        ):
-            time_fn = getattr(self, "_time_fn", time.monotonic)
-            queue.demote_idle(ttl_s, now=time_fn())
+        time_fn = getattr(self, "_time_fn", time.monotonic)
+        if isinstance(queue, TieredFreeKVCacheBlockQueue):
+            now = time_fn()
+            self.promote_dead_session_blocks(now)
+            if ttl_s > 0:
+                queue.demote_idle(
+                    ttl_s,
+                    now=now,
+                    mode=getattr(self, "_suffix_idle_demote", "all"),
+                )
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
@@ -678,6 +688,9 @@ class BlockPool:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 block.freed_at = None
+                block.session_id = None
+                block.evict_tier = None
+                block.idle_protect = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
@@ -685,6 +698,9 @@ class BlockPool:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 block.freed_at = None
+                block.session_id = None
+                block.evict_tier = None
+                block.idle_protect = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -753,7 +769,18 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_with_hash)
 
     def enable_prefix_first_eviction(
-        self, num_tiers: int = 1, idle_ttl_s: float = 0.0
+        self,
+        num_tiers: int = 1,
+        idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+        idle_demote: str = "all",
+        idle_protect_len: int = 0,
     ) -> None:
         """Switch the free queue to one with `num_tiers` evict-first tiers used
         by `free_blocks_tiered`. Must be called before any allocation."""
@@ -765,17 +792,72 @@ class BlockPool:
         for block in free_blocks:
             block.prev_free_block = block.next_free_block = None
             block.freed_at = None
+            block.session_id = None
+            block.evict_tier = None
+            block.idle_protect = False
         self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
         self._suffix_idle_ttl_s = idle_ttl_s
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "idle_demote must be 'all', 'protect', or 'step', "
+                f"got {idle_demote}"
+            )
+        if idle_protect_len < 0:
+            raise ValueError(f"idle_protect_len must be >= 0, got {idle_protect_len}")
+        self._suffix_idle_demote = idle_demote
+        self._suffix_idle_protect_len = idle_protect_len
+        self.session_tracker = SessionLivenessTracker(
+            min_ttl_s=session_dead_ttl_s,
+            ewa_alpha=session_ewa_alpha,
+            dead_k=session_dead_k,
+            min_gaps=session_min_gaps,
+            detector=session_detector,  # type: ignore[arg-type]
+            quantile=session_quantile,
+            gap_window=session_gap_window,
+        )
         # Overridable clock for tests / CPU simulator (defaults to wall time).
         if not hasattr(self, "_time_fn"):
             self._time_fn = time.monotonic
+
+    def promote_dead_session_blocks(self, now: float | None = None) -> int:
+        """Move a predicted-dead session's remaining unique KV to evict-first.
+
+        Unlike idle-TTL demotion (peel another prefix layer), this promotes
+        every hashed free block of that session so the whole leftover suffix
+        is reclaimed before live sessions are touched.
+        """
+        tracker = self.session_tracker
+        if not tracker.enabled:
+            return 0
+        queue = self.free_block_queue
+        if not isinstance(queue, TieredFreeKVCacheBlockQueue):
+            return 0
+        if now is None:
+            now = self._time_fn()
+        dead = tracker.dead_session_ids(now)
+        if not dead:
+            return 0
+        dead_set = set(dead)
+        to_promote = [
+            block
+            for block in queue.get_all_free_blocks()
+            if block.session_id in dead_set and block.block_hash is not None
+        ]
+        if not to_promote:
+            tracker.mark_promoted(dead)
+            return 0
+        for block in to_promote:
+            queue.remove(block)
+        queue.prepend_n_to_tier(to_promote, 0)
+        tracker.mark_promoted(dead)
+        return len(to_promote)
 
     def free_blocks_tiered(
         self,
         blocks: Sequence[KVCacheBlock],
         first_tier_len: int,
         tier_len: int = 0,
+        session_id: str | None = None,
     ) -> None:
         """Free a request's blocks, given in token order, into the evict-first
         tiers by block position.
@@ -799,21 +881,27 @@ class BlockPool:
         blocks_without_hash: list[KVCacheBlock] = []
         time_fn = getattr(self, "_time_fn", time.monotonic)
         now = time_fn()
+        protect_from = max(0, len(blocks) - getattr(self, "_suffix_idle_protect_len", 0))
         for idx, block in enumerate(blocks):
             block.ref_cnt -= 1
             if block.ref_cnt != 0 or block.is_null:
                 continue
             if block.block_hash is None:
                 blocks_without_hash.append(block)
-            elif idx < first_tier_len:
-                block.freed_at = now
+                continue
+            block.freed_at = now
+            block.session_id = session_id
+            block.idle_protect = idx >= protect_from and protect_from < len(blocks)
+            if idx < first_tier_len:
+                block.evict_tier = 0
                 tiers[0].append(block)
             elif tier_len > 0:
                 tier = 1 + (idx - first_tier_len) // tier_len
-                block.freed_at = now
-                tiers[min(tier, num_tiers)].append(block)
+                placed = min(tier, num_tiers)
+                block.evict_tier = placed
+                tiers[placed].append(block)
             else:
-                block.freed_at = now
+                block.evict_tier = num_tiers
                 tiers[num_tiers].append(block)
 
         queue.prepend_n(blocks_without_hash)

@@ -301,6 +301,15 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
     VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
     VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
+    VLLM_SUFFIX_EVICTION_IDLE_DEMOTE: str = "all"
+    VLLM_SUFFIX_EVICTION_PROTECT_TOKENS: int = 0
+    VLLM_SUFFIX_SESSION_DEAD_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_EWA_ALPHA: float = 0.3
+    VLLM_SUFFIX_SESSION_DEAD_K: float = 3.0
+    VLLM_SUFFIX_SESSION_MIN_GAPS: int = 2
+    VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
+    VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
+    VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
 
 
 def get_default_cache_root():
@@ -1157,6 +1166,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # later-tier content.
     "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
         os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
+    ),
+    # How idle-TTL ages free blocks. Default ``all`` is the historical
+    # behavior (dump every expired unique block into tier 0, suffix too).
+    # ``protect`` skips the last PROTECT_TOKENS of each request.
+    # ``step`` moves one tier toward 0 per TTL instead of jumping to tier 0
+    # (also honors PROTECT_TOKENS). Session-dead wipe is unchanged.
+    "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE": lambda: os.getenv(
+        "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE", "all"
+    ),
+    # Last this many tokens of a freed request are not idle-demoted.
+    # 0 disables. 32768 keeps a 32K suffix hit after a long think.
+    "VLLM_SUFFIX_EVICTION_PROTECT_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_PROTECT_TOKENS", "0")
+    ),
+    # Session-aware full eviction. 0 disables. When a session's idle time
+    # since its last finished turn exceeds a threshold, its remaining unique
+    # KV is promoted for full eviction instead of another prefix-first peel.
+    # Threshold is always at least this floor. After MIN_GAPS samples the
+    # detector may raise it (ewa + K*std, or a server-wide quantile).
+    "VLLM_SUFFIX_SESSION_DEAD_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_TTL_S", "0")
+    ),
+    "VLLM_SUFFIX_SESSION_EWA_ALPHA": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_EWA_ALPHA", "0.3")
+    ),
+    "VLLM_SUFFIX_SESSION_DEAD_K": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_K", "3")
+    ),
+    "VLLM_SUFFIX_SESSION_MIN_GAPS": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_MIN_GAPS", "2")
+    ),
+    # ewa = per-session EWA + k·std (never below DEAD_TTL).
+    # global = server-wide think-time quantile (never below DEAD_TTL).
+    "VLLM_SUFFIX_SESSION_DETECTOR": lambda: os.getenv(
+        "VLLM_SUFFIX_SESSION_DETECTOR", "ewa"
+    ),
+    "VLLM_SUFFIX_SESSION_QUANTILE": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_QUANTILE", "0.95")
+    ),
+    "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
@@ -2221,6 +2271,15 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
         "VLLM_SUFFIX_EVICTION_MAX_TIERS",
         "VLLM_SUFFIX_EVICTION_IDLE_TTL_S",
+        "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE",
+        "VLLM_SUFFIX_EVICTION_PROTECT_TOKENS",
+        "VLLM_SUFFIX_SESSION_DEAD_TTL_S",
+        "VLLM_SUFFIX_SESSION_EWA_ALPHA",
+        "VLLM_SUFFIX_SESSION_DEAD_K",
+        "VLLM_SUFFIX_SESSION_MIN_GAPS",
+        "VLLM_SUFFIX_SESSION_DETECTOR",
+        "VLLM_SUFFIX_SESSION_QUANTILE",
+        "VLLM_SUFFIX_SESSION_GAP_WINDOW",
     }
 
     from vllm.config.utils import normalize_value

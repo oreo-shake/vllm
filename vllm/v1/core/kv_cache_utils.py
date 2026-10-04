@@ -141,6 +141,15 @@ class KVCacheBlock:
     # (hashed) block. None for never-allocated blocks. Used by idle-TTL
     # demotion under suffix-preserving eviction.
     freed_at: float | None = None
+    # Session that last freed this cached block. Used to promote a predicted-
+    # dead session's remaining unique KV for full eviction.
+    session_id: str | None = None
+    # Evict-first tier this block was placed in at free time (0 = first peel,
+    # num_tiers = LRU tail). Used by stepwise idle demotion.
+    evict_tier: int | None = None
+    # Last N tokens of this request. Idle-TTL must not dump these to tier 0
+    # (session-dead wipe still may). Lets a long think keep a suffix hit.
+    idle_protect: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -515,16 +524,69 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         boundary.prev_free_block = prev_block
         self.num_free_blocks += len(blocks)
 
-    def demote_idle(self, ttl_s: float, now: float | None = None) -> int:
-        """Move free blocks idle for at least `ttl_s` into tier 0.
+    def prepend_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        """Insert blocks at the start of an evict-first tier.
 
-        Never-allocated blocks (`freed_at is None`) are left alone. Expired
-        cached blocks from later tiers or the LRU tail are removed and
-        appended to tier 0 so they are reclaimed before any non-expired
-        later-tier content. Returns the number of demoted blocks.
+        For tier 0 this is after never-allocated blocks and before any other
+        cached tier-0 content, so a dead session is fully reclaimed before
+        a live session's prefix is peeled.
+        """
+        if len(blocks) == 0:
+            return
+        boundary = self._boundaries[tier]
+        if tier == 0:
+            insert_after = self.fake_free_list_head
+            curr = self.fake_free_list_head.next_free_block
+            while curr is not None and curr is not boundary:
+                if curr.block_id == _TIER_BOUNDARY_BLOCK_ID:
+                    break
+                if curr.freed_at is None and curr.block_hash is None:
+                    insert_after = curr
+                    curr = curr.next_free_block
+                    continue
+                break
+        else:
+            insert_after = self._boundaries[tier - 1]
+        nxt = insert_after.next_free_block
+        prev_block = insert_after
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = nxt
+        if nxt is not None:
+            nxt.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def demote_idle(
+        self,
+        ttl_s: float,
+        now: float | None = None,
+        mode: str = "all",
+    ) -> int:
+        """Age free blocks that have been idle for at least `ttl_s`.
+
+        Never-allocated blocks (`freed_at is None`) are left alone.
+
+        * ``all`` (default, historical): dump every expired hashed block into
+          tier 0, including the request's suffix. Finished / long-idle
+          sessions are reclaimed before fresher later-tier content.
+        * ``protect``: same dump, but skip ``idle_protect`` blocks (the last
+          N tokens of that request). Those stay in their current tier so a
+          returning long session can still suffix-hit.
+        * ``step``: move each expired unprotected block one tier toward 0
+          instead of jumping to tier 0. A suffix in a high tier takes many
+          TTLs to become evict-first. ``idle_protect`` blocks are skipped.
+
+        Session-dead promotion is a separate path and still full-wipes.
+        Returns the number of blocks that moved.
         """
         if ttl_s <= 0:
             return 0
+        if mode not in ("all", "protect", "step"):
+            raise ValueError(
+                f"idle demote mode must be 'all', 'protect', or 'step', got {mode}"
+            )
         if now is None:
             now = time.monotonic()
         expired = [
@@ -534,10 +596,38 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         ]
         if not expired:
             return 0
-        for block in expired:
-            self.remove(block)
-        self.append_n_to_tier(expired, 0)
-        return len(expired)
+        if mode == "all":
+            for block in expired:
+                self.remove(block)
+                block.evict_tier = 0
+            self.append_n_to_tier(expired, 0)
+            return len(expired)
+
+        movable = [b for b in expired if not b.idle_protect]
+        if not movable:
+            return 0
+        if mode == "protect":
+            for block in movable:
+                self.remove(block)
+                block.evict_tier = 0
+            self.append_n_to_tier(movable, 0)
+            return len(movable)
+
+        by_dest: dict[int, list[KVCacheBlock]] = {}
+        for block in movable:
+            tier = block.evict_tier
+            if tier is None or tier <= 0:
+                continue
+            dest = tier - 1
+            by_dest.setdefault(dest, []).append(block)
+        moved = 0
+        for dest, blocks in by_dest.items():
+            for block in blocks:
+                self.remove(block)
+                block.evict_tier = dest
+            self.append_n_to_tier(blocks, dest)
+            moved += len(blocks)
+        return moved
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         return [

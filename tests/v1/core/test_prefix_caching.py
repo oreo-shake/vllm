@@ -73,6 +73,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     lora_request: LoRARequest | None = None,
+    session_id: str | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -98,6 +99,7 @@ def make_request(
         lora_request=lora_request,
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(block_size, hash_fn),
+        session_id=session_id,
     )
 
 
@@ -1501,6 +1503,83 @@ def test_suffix_preserving_eviction_tiers(
         assert all(cached[num_evicted:])
         evicted.append(num_evicted)
     assert evicted == expected
+
+
+def test_dead_session_full_evict_before_live_prefix():
+    """A predicted-dead session loses its leftover suffix before a live
+    session's prefix is peeled."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 1 + 8),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(
+        0.5,
+        2 * block_size,
+        2 * block_size,
+        session_dead_ttl_s=5.0,
+        session_ewa_alpha=1.0,
+        session_dead_k=0.0,
+        session_min_gaps=1,
+    )
+    clock = [0.0]
+    manager.block_pool._time_fn = lambda: clock[0]
+
+    def run(req: Request, num_tokens: int) -> None:
+        computed_blocks, _, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+
+    req_a = make_request(
+        "a", list(range(4 * block_size)), block_size, sha256, session_id="sessA"
+    )
+    req_b = make_request(
+        "b",
+        list(range(1000, 1000 + 4 * block_size)),
+        block_size,
+        sha256,
+        session_id="sessB",
+    )
+    manager.note_session_arrival(req_a)
+    run(req_a, 4 * block_size)
+    manager.note_session_arrival(req_b)
+    run(req_b, 4 * block_size)
+
+    clock[0] = 10.0
+    manager.free(req_a)
+    manager.free(req_b)
+
+    # A has a short observed think time. B finished later so it is still live.
+    state_a = manager.block_pool.session_tracker.states["sessA"]
+    state_a.n_gaps = 1
+    state_a.ewa_gap = 2.0
+    state_a.ewa_gap_sq = 4.0
+    state_a.last_arrival = 8.0
+    state_a.last_finish = 10.0
+    state_b = manager.block_pool.session_tracker.states["sessB"]
+    state_b.last_arrival = 16.0
+    state_b.last_finish = 18.0
+
+    # t=20: A idle=10 >= max(5, 2) → dead; B idle=2 < floor 5 → live.
+    clock[0] = 20.0
+    filler = make_request(
+        "f", list(range(10**5, 10**5 + 3 * block_size)), block_size, sha256
+    )
+    run(filler, 3 * block_size)
+
+    a_cached = [
+        manager.block_pool.get_cached_block(h, [0]) is not None
+        for h in req_a.block_hashes
+    ]
+    b_cached = [
+        manager.block_pool.get_cached_block(h, [0]) is not None
+        for h in req_b.block_hashes
+    ]
+    # Dead session A is fully (or almost fully) reclaimed first.
+    assert sum(a_cached) <= 1
+    # Live session B is untouched.
+    assert all(b_cached)
 
 
 def test_hash_block_correct_reuse():

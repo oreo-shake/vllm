@@ -77,6 +77,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        session_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -93,6 +94,13 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.session_id = session_id
+        if self.session_id is None and sampling_params is not None:
+            extra_args = sampling_params.extra_args
+            if extra_args is not None:
+                extra_sid = extra_args.get("session_id")
+                if isinstance(extra_sid, str) and extra_sid:
+                    self.session_id = extra_sid
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -239,6 +247,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            session_id=request.session_id,
         )
 
     def append_output_token_ids(

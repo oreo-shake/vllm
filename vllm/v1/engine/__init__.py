@@ -136,6 +136,10 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Conversation / agent-run identity. Optional; used by session-aware
+    # suffix eviction. Also accepted via extra_args["session_id"].
+    session_id: str | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

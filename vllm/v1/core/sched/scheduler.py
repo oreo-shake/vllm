@@ -1268,30 +1268,89 @@ class Scheduler(SchedulerInterface):
         step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
         max_tiers = envs.VLLM_SUFFIX_EVICTION_MAX_TIERS
         idle_ttl_s = envs.VLLM_SUFFIX_EVICTION_IDLE_TTL_S
+        session_dead_ttl_s = envs.VLLM_SUFFIX_SESSION_DEAD_TTL_S
+        session_ewa_alpha = envs.VLLM_SUFFIX_SESSION_EWA_ALPHA
+        session_dead_k = envs.VLLM_SUFFIX_SESSION_DEAD_K
+        session_min_gaps = envs.VLLM_SUFFIX_SESSION_MIN_GAPS
+        session_detector = envs.VLLM_SUFFIX_SESSION_DETECTOR
+        session_quantile = envs.VLLM_SUFFIX_SESSION_QUANTILE
+        session_gap_window = envs.VLLM_SUFFIX_SESSION_GAP_WINDOW
+        idle_demote = envs.VLLM_SUFFIX_EVICTION_IDLE_DEMOTE
+        idle_protect_tokens = envs.VLLM_SUFFIX_EVICTION_PROTECT_TOKENS
         if tier_tokens < 0 or step_tokens < 0:
             raise ValueError("Suffix eviction tier sizes must not be negative")
         if max_tiers < 0:
             raise ValueError("VLLM_SUFFIX_EVICTION_MAX_TIERS must not be negative")
         if idle_ttl_s < 0:
             raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
+        if session_dead_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_DEAD_TTL_S must not be negative")
+        if not 0.0 < session_ewa_alpha <= 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_EWA_ALPHA must be in (0, 1], "
+                f"got {session_ewa_alpha}"
+            )
+        if session_dead_k < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_DEAD_K must not be negative")
+        if session_min_gaps < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_MIN_GAPS must not be negative")
+        if session_detector not in ("ewa", "global"):
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_DETECTOR must be 'ewa' or 'global', "
+                f"got {session_detector}"
+            )
+        if not 0.0 < session_quantile < 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_QUANTILE must be in (0, 1), "
+                f"got {session_quantile}"
+            )
+        if session_gap_window < 1:
+            raise ValueError("VLLM_SUFFIX_SESSION_GAP_WINDOW must be >= 1")
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE must be 'all', 'protect', "
+                f"or 'step', got {idle_demote}"
+            )
+        if idle_protect_tokens < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_PROTECT_TOKENS must not be negative")
         self.kv_cache_manager.enable_suffix_preserving_eviction(
-            fraction, tier_tokens, step_tokens, max_tiers, idle_ttl_s
+            fraction,
+            tier_tokens,
+            step_tokens,
+            max_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+            idle_demote=idle_demote,
+            idle_protect_tokens=idle_protect_tokens,
         )
         if tier_tokens:
             logger.info(
                 "Suffix-preserving eviction enabled with eviction tiers of %d "
-                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s).",
+                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s, "
+                "idle_demote=%s, protect_tokens=%s, "
+                "session_dead_ttl_s=%s, detector=%s).",
                 tier_tokens,
                 step_tokens or tier_tokens,
                 max_tiers or "uncapped",
                 idle_ttl_s or "off",
+                idle_demote,
+                idle_protect_tokens or "off",
+                session_dead_ttl_s or "off",
+                session_detector if session_dead_ttl_s else "off",
             )
         else:
             logger.info(
                 "Suffix-preserving eviction enabled with prefix fraction %.2f "
-                "(idle_ttl_s=%s).",
+                "(idle_ttl_s=%s, session_dead_ttl_s=%s).",
                 fraction,
                 idle_ttl_s or "off",
+                session_dead_ttl_s or "off",
             )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
@@ -2224,6 +2283,7 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            self.kv_cache_manager.note_session_arrival(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
