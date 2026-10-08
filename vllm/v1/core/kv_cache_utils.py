@@ -150,6 +150,9 @@ class KVCacheBlock:
     # Last N tokens of this request. Idle-TTL must not dump these to tier 0
     # (session-dead wipe still may). Lets a long think keep a suffix hit.
     idle_protect: bool = False
+    # Extra ref held by automatic system-prompt pinning. Pinned blocks stay
+    # out of the free queue so the shared prefix is never recomputed.
+    pinned: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:

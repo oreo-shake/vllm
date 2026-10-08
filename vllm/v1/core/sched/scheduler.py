@@ -292,6 +292,8 @@ class Scheduler(SchedulerInterface):
         self._suffix_hits: dict[str, tuple[int, int]] = {}
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
+        if envs.VLLM_PIN_SYSTEM_PROMPT:
+            self._enable_system_prompt_pin()
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -1352,6 +1354,42 @@ class Scheduler(SchedulerInterface):
                 idle_ttl_s or "off",
                 session_dead_ttl_s or "off",
             )
+
+    def _enable_system_prompt_pin(self) -> None:
+        min_requests = envs.VLLM_PIN_MIN_REQUESTS
+        share = envs.VLLM_PIN_SHARE
+        drop = envs.VLLM_PIN_DROP
+        max_tokens = envs.VLLM_PIN_MAX_TOKENS
+        probe_tokens = envs.VLLM_PIN_PROBE_TOKENS
+        confirm = envs.VLLM_PIN_CONFIRM
+        window = envs.VLLM_PIN_WINDOW
+        max_clusters = envs.VLLM_PIN_MAX_CLUSTERS
+        if min_requests < 2:
+            raise ValueError("VLLM_PIN_MIN_REQUESTS must be >= 2")
+        if not 0.0 < share <= 1.0:
+            raise ValueError("VLLM_PIN_SHARE must be in (0, 1]")
+        if not 0.0 < drop <= 1.0:
+            raise ValueError("VLLM_PIN_DROP must be in (0, 1]")
+        if max_tokens < 1:
+            raise ValueError("VLLM_PIN_MAX_TOKENS must be >= 1")
+        if probe_tokens < 1:
+            raise ValueError("VLLM_PIN_PROBE_TOKENS must be >= 1")
+        if confirm < 1:
+            raise ValueError("VLLM_PIN_CONFIRM must be >= 1")
+        if window < min_requests:
+            raise ValueError("VLLM_PIN_WINDOW must be >= VLLM_PIN_MIN_REQUESTS")
+        if max_clusters < 1:
+            raise ValueError("VLLM_PIN_MAX_CLUSTERS must be >= 1")
+        self.kv_cache_manager.enable_system_prompt_pin(
+            min_requests=min_requests,
+            share=share,
+            drop=drop,
+            max_pin_tokens=max_tokens,
+            probe_tokens=probe_tokens,
+            confirm=confirm,
+            window=window,
+            max_clusters=max_clusters,
+        )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

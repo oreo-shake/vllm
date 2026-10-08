@@ -5,7 +5,7 @@ import itertools
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -15,7 +15,8 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.prefix_pin import PinSnapshot, SystemPromptPinDetector
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -190,6 +191,8 @@ class KVCacheManager:
 
         # Set by `enable_suffix_preserving_eviction`.
         self._suffix_hit_manager: FullAttentionManager | None = None
+        # Set by `enable_system_prompt_pin`. Independent of prefix-first.
+        self._prefix_pin: SystemPromptPinDetector | None = None
 
     def enable_suffix_preserving_eviction(
         self,
@@ -309,13 +312,91 @@ class KVCacheManager:
         )
         self._suffix_hit_manager = manager
 
+    def enable_system_prompt_pin(
+        self,
+        min_requests: int = 8,
+        share: float = 0.75,
+        drop: float = 0.20,
+        max_pin_tokens: int = 8192,
+        probe_tokens: int = 16384,
+        confirm: int = 2,
+        window: int = 64,
+        max_clusters: int = 4,
+    ) -> None:
+        """Detect the shared leading prefix and pin it against eviction.
+
+        Works with native LRU or prefix-first. Default-off; the scheduler
+        turns this on via ``VLLM_PIN_SYSTEM_PROMPT``.
+        """
+        if not self.enable_caching:
+            raise ValueError("System-prompt pinning requires prefix caching.")
+        block_size = self.block_pool.hash_block_size
+        max_pin_blocks = max(1, max_pin_tokens // block_size)
+        max_probe_blocks = max(max_pin_blocks, probe_tokens // block_size)
+        self._prefix_pin = SystemPromptPinDetector(
+            min_requests=min_requests,
+            share=share,
+            drop=drop,
+            max_pin_blocks=max_pin_blocks,
+            max_probe_blocks=max_probe_blocks,
+            confirm=confirm,
+            window=window,
+            max_clusters=max_clusters,
+        )
+        logger.info(
+            "System-prompt pin enabled (min_requests=%d, share=%.2f, "
+            "drop=%.2f, max_pin_tokens=%d, confirm=%d, window=%d).",
+            min_requests,
+            share,
+            drop,
+            max_pin_tokens,
+            confirm,
+            window,
+        )
+
     def note_session_arrival(self, request: Request) -> None:
         tracker = self.block_pool.session_tracker
-        if not tracker.enabled:
-            return
-        tracker.on_arrival(
-            request.session_id, getattr(self.block_pool, "_time_fn", time.monotonic)()
+        if tracker.enabled:
+            tracker.on_arrival(
+                request.session_id,
+                getattr(self.block_pool, "_time_fn", time.monotonic)(),
+            )
+        self.note_prefix_for_pin(request)
+
+    def note_prefix_for_pin(self, request: Request) -> PinSnapshot | None:
+        detector = self._prefix_pin
+        if detector is None:
+            return None
+        hashes = tuple(request.block_hashes)
+        if not hashes:
+            return None
+        session_id = request.session_id or request.request_id
+        snapshot = detector.observe(session_id, hashes)
+        if snapshot is None:
+            return None
+        held, released = self.block_pool.set_pinned_hashes(
+            cast(tuple[BlockHash, ...], snapshot.hashes)
         )
+        if snapshot.hashes:
+            logger.info(
+                "Pinned system-prompt prefix: %d blocks "
+                "(held=%d released=%d clusters=%d n_obs=%d cliff=%d "
+                "coverage=%s).",
+                len(snapshot.hashes),
+                held,
+                released,
+                snapshot.clusters,
+                snapshot.n_obs,
+                snapshot.cliff,
+                ",".join(f"{c:.2f}" for c in snapshot.coverage[:8]),
+            )
+        else:
+            logger.info(
+                "Unpinned system-prompt prefix (released=%d, n_obs=%d).",
+                released,
+                snapshot.n_obs,
+            )
+        return snapshot
 
     def get_suffix_hit(
         self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int

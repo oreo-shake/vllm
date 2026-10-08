@@ -310,6 +310,15 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
     VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
     VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
+    VLLM_PIN_SYSTEM_PROMPT: bool = False
+    VLLM_PIN_MIN_REQUESTS: int = 8
+    VLLM_PIN_SHARE: float = 0.75
+    VLLM_PIN_DROP: float = 0.20
+    VLLM_PIN_MAX_TOKENS: int = 8192
+    VLLM_PIN_PROBE_TOKENS: int = 16384
+    VLLM_PIN_CONFIRM: int = 2
+    VLLM_PIN_WINDOW: int = 64
+    VLLM_PIN_MAX_CLUSTERS: int = 4
 
 
 def get_default_cache_root():
@@ -1208,6 +1217,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
         os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
     ),
+    # Automatic system-prompt pinning. 0 disables (default). When on, the
+    # engine watches the first turn of N unique sessions, builds a monotone
+    # per-position share curve of leading block hashes, and pins the prefix
+    # up to the coverage cliff so those blocks never recompute. Independent
+    # of prefix-first eviction; compare pin vs no-pin vs native LRU.
+    "VLLM_PIN_SYSTEM_PROMPT": lambda: bool(
+        int(os.getenv("VLLM_PIN_SYSTEM_PROMPT", "0"))
+    ),
+    "VLLM_PIN_MIN_REQUESTS": lambda: int(os.getenv("VLLM_PIN_MIN_REQUESTS", "8")),
+    "VLLM_PIN_SHARE": lambda: float(os.getenv("VLLM_PIN_SHARE", "0.75")),
+    "VLLM_PIN_DROP": lambda: float(os.getenv("VLLM_PIN_DROP", "0.20")),
+    "VLLM_PIN_MAX_TOKENS": lambda: int(os.getenv("VLLM_PIN_MAX_TOKENS", "8192")),
+    "VLLM_PIN_PROBE_TOKENS": lambda: int(os.getenv("VLLM_PIN_PROBE_TOKENS", "16384")),
+    "VLLM_PIN_CONFIRM": lambda: int(os.getenv("VLLM_PIN_CONFIRM", "2")),
+    "VLLM_PIN_WINDOW": lambda: int(os.getenv("VLLM_PIN_WINDOW", "64")),
+    "VLLM_PIN_MAX_CLUSTERS": lambda: int(os.getenv("VLLM_PIN_MAX_CLUSTERS", "4")),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.
@@ -2280,6 +2305,15 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_SESSION_DETECTOR",
         "VLLM_SUFFIX_SESSION_QUANTILE",
         "VLLM_SUFFIX_SESSION_GAP_WINDOW",
+        "VLLM_PIN_SYSTEM_PROMPT",
+        "VLLM_PIN_MIN_REQUESTS",
+        "VLLM_PIN_SHARE",
+        "VLLM_PIN_DROP",
+        "VLLM_PIN_MAX_TOKENS",
+        "VLLM_PIN_PROBE_TOKENS",
+        "VLLM_PIN_CONFIRM",
+        "VLLM_PIN_WINDOW",
+        "VLLM_PIN_MAX_CLUSTERS",
     }
 
     from vllm.config.utils import normalize_value
