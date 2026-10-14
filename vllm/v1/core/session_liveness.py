@@ -16,6 +16,12 @@ Two detectors:
   Threshold is ``max(DEAD_TTL, quantile of recent gaps)``. One session's
   short thinks cannot make that session look dead; the bar is "longer
   than almost every think we have seen on this server."
+
+Priority 0 can opt into a separate cap, ``min(TTL_limit, K · EWMA gap)``.
+The gap is completion to the next arrival. ``TTL_limit <= 0`` leaves this
+off, so the detectors above are unchanged. Priorities 1+ do not use the
+cap; with the think-time floor also at 0 they are never predicted dead.
+The priority check is the extension point for later policies.
 """
 
 from __future__ import annotations
@@ -55,12 +61,24 @@ def resolve_session_id(
 
 @dataclass
 class SessionLivenessState:
+    """Per-session row. Keyed by ``session_id`` in the tracker table.
+
+    ``first_arrival`` is the registering request. ``last_finish`` is the
+    latest completion. ``n_requests`` counts arrivals. ``ewa_gap`` is the
+    completion-to-next-arrival EWMA. ``first_request_hashes`` is the
+    priority-0 prefix captured at registration. ``stale`` means idle
+    expiry cleared advisory protection until a later arrival revives it.
+    """
+
     last_finish: float | None = None
     last_arrival: float | None = None
+    first_arrival: float | None = None
+    n_requests: int = 0
     n_gaps: int = 0
     ewa_gap: float = 0.0
     ewa_gap_sq: float = 0.0
     predicted_dead: bool = False
+    stale: bool = False
     priority: int = 0
     first_request_hashes: tuple[Any, ...] = ()
 
@@ -132,34 +150,94 @@ class SessionLivenessTracker:
         if not session_id or not self.enabled:
             return
         state = self.states.setdefault(session_id, SessionLivenessState())
+        # Gap is completion → next arrival, including the gap that revives
+        # a stale session. A turn that arrives before the previous finish
+        # contributes no sample.
         if state.last_finish is not None:
             gap = max(0.0, now - state.last_finish)
             self._observe_gap(state, gap)
-        if state.last_arrival is None:
+        if state.first_arrival is None:
+            state.first_arrival = now
             state.priority = priority
-            if priority == 0:
+            if (
+                priority == 0
+                and self.session_ttl_limit_s > 0
+                and first_request_hashes
+            ):
                 state.first_request_hashes = first_request_hashes
+        state.n_requests += 1
         state.last_arrival = now
+        # A new arrival revives the session and its advisory prefix.
         state.predicted_dead = False
+        state.stale = False
 
-    def on_finish(self, session_id: str | None, now: float) -> None:
+    def on_finish(
+        self,
+        session_id: str | None,
+        now: float,
+        block_hashes: tuple[Any, ...] = (),
+    ) -> None:
         if not session_id or not self.enabled:
             return
         state = self.states.setdefault(session_id, SessionLivenessState())
         state.last_finish = now
+        # Arrival usually has the prompt prefix. If that snapshot was empty,
+        # the first completion can still seal it before blocks are freed.
+        if (
+            self.session_ttl_limit_s > 0
+            and state.priority == 0
+            and state.n_requests == 1
+            and state.first_arrival is not None
+            and not state.first_request_hashes
+            and block_hashes
+        ):
+            state.first_request_hashes = block_hashes
 
     def adaptive_ttl(self, state: SessionLivenessState) -> float | None:
-        """Return the capped local TTL for an active priority-0 session."""
+        """Return ``min(TTL_limit, K · EWMA)`` for an active priority-0 session.
+
+        ``None`` means this session stays on the ordinary think-time
+        detector (priorities 1+, or the cap env left at 0). With no
+        observed gap yet, the cap itself is the TTL.
+        """
         if self.session_ttl_limit_s <= 0 or state.priority != 0:
             return None
         if state.n_gaps == 0:
             return self.session_ttl_limit_s
         return min(self.session_ttl_limit_s, self.session_ttl_k * state.ewa_gap)
 
+    def first_request_hashes_for(
+        self, session_id: str | None, now: float
+    ) -> tuple[Any, ...]:
+        """Advisory first-request hashes, or empty when protection is off.
+
+        Off unless the priority-0 cap is configured, the session is
+        priority 0, and it has not gone stale. Idle expiry marks the
+        session stale and drops the metadata. A later arrival revives it.
+        """
+        if self.session_ttl_limit_s <= 0 or not session_id:
+            return ()
+        state = self.states.get(session_id)
+        if (
+            state is None
+            or state.priority != 0
+            or not state.first_request_hashes
+        ):
+            return ()
+        if state.stale or self.is_dead(session_id, now):
+            state.stale = True
+            state.predicted_dead = True
+            return ()
+        return state.first_request_hashes
+
     def threshold(self, state: SessionLivenessState) -> float:
         adaptive_ttl = self.adaptive_ttl(state)
         if adaptive_ttl is not None:
             return adaptive_ttl
+        # The think-time detector stays off when its floor is 0. Enabling
+        # only the priority-0 cap must not mark priorities 1+ dead.
+        if self.min_ttl_s <= 0:
+            return math.inf
         if self.detector == "global":
             if len(self._global_gaps) < self.min_gaps:
                 return self.min_ttl_s
@@ -189,6 +267,7 @@ class SessionLivenessTracker:
             state = self.states.get(sid)
             if state is not None:
                 state.predicted_dead = True
+                state.stale = True
 
     def _observe_gap(self, state: SessionLivenessState, gap: float) -> None:
         self._global_gaps.append(gap)

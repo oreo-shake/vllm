@@ -245,6 +245,13 @@ class KVCacheManager:
             session_quantile: Quantile for detector=global (e.g. 0.95).
             session_gap_window: Recent think times kept for the global
                 quantile.
+            session_ttl_limit_s: When > 0, priority-0 sessions go stale at
+                ``min(limit, K * EWMA gap)`` instead of the think-time
+                detector. 0 leaves that detector unchanged. Priorities 1+
+                stay on ordinary tiered eviction. First-request hashes are
+                advisory metadata and do not take an extra reference.
+            session_ttl_k: Multiplier on the priority-0 EWMA gap. EWMA alpha
+                is ``session_ewa_alpha``.
             idle_demote: ``all`` dumps expired unique KV to tier 0 (historical).
                 ``protect`` skips the last ``idle_protect_tokens``. ``step``
                 ages one tier per TTL (also honors protect).
@@ -368,13 +375,16 @@ class KVCacheManager:
     def note_session_arrival(self, request: Request) -> None:
         tracker = self.block_pool.session_tracker
         if tracker.enabled:
+            # Only the priority-0 cap records a first-request prefix.
+            # Priority is forwarded as scheduling already stored it.
+            hashes = ()
+            if request.priority == 0 and tracker.session_ttl_limit_s > 0:
+                hashes = tuple(request.block_hashes)
             tracker.on_arrival(
                 request.session_id,
                 getattr(self.block_pool, "_time_fn", time.monotonic)(),
                 priority=request.priority,
-                first_request_hashes=tuple(request.block_hashes)
-        if request.priority == 0
-        else (),
+                first_request_hashes=hashes,
             )
         self.note_prefix_for_pin(request)
 
@@ -785,9 +795,14 @@ class KVCacheManager:
         """
         tracker = self.block_pool.session_tracker
         if tracker.enabled:
+            now = getattr(self.block_pool, "_time_fn", time.monotonic)()
+            hashes = ()
+            if request.priority == 0 and tracker.session_ttl_limit_s > 0:
+                hashes = tuple(request.block_hashes)
             tracker.on_finish(
                 request.session_id,
-                getattr(self.block_pool, "_time_fn", time.monotonic)(),
+                now,
+                block_hashes=hashes,
             )
         self.coordinator.free(request.request_id, session_id=request.session_id)
 

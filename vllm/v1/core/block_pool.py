@@ -814,6 +814,7 @@ class BlockPool:
             block.session_id = None
             block.evict_tier = None
             block.idle_protect = False
+            block.session_protected = False
             block.pinned = False
         self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
         self._suffix_idle_ttl_s = idle_ttl_s
@@ -908,6 +909,11 @@ class BlockPool:
         time_fn = getattr(self, "_time_fn", time.monotonic)
         now = time_fn()
         protect_from = max(0, len(blocks) - getattr(self, "_suffix_idle_protect_len", 0))
+        # Advisory only: matching blocks stay in the tiered free queue with
+        # ref_cnt == 0, so GPU pressure can still evict them before TTL.
+        protected_hashes = set(
+            self.session_tracker.first_request_hashes_for(session_id, now)
+        )
         for idx, block in enumerate(blocks):
             block.ref_cnt -= 1
             if block.ref_cnt != 0 or block.is_null:
@@ -920,16 +926,9 @@ class BlockPool:
                 continue
             block.freed_at = now
             block.session_id = session_id
-            first_hashes = (
-                self.session_tracker.states[session_id].first_request_hashes
-                if session_id is not None
-                and session_id in self.session_tracker.states
-                else ()
-            )
             block.session_protected = (
-                bool(first_hashes)
-                and block.block_hash is not None
-                and get_block_hash(block.block_hash) in first_hashes
+                block.block_hash is not None
+                and get_block_hash(block.block_hash) in protected_hashes
             )
             block.idle_protect = idx >= protect_from and protect_from < len(blocks)
             if idx < first_tier_len:

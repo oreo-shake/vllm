@@ -292,9 +292,15 @@ class Scheduler(SchedulerInterface):
         self._suffix_hits: dict[str, tuple[int, int]] = {}
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
-        # Session-aware first-request protection is integrated into the
-        # suffix-preserving eviction path; do not activate the legacy global
-        # coverage-based hard pinning path by default.
+        # Coverage-cliff system-prompt pinning is not the default path.
+        # Priority-0 first-request metadata lives on the suffix-preserving
+        # tracker and does not take an extra reference count.
+        if envs.VLLM_PIN_SYSTEM_PROMPT:
+            logger.info(
+                "VLLM_PIN_SYSTEM_PROMPT is set, but coverage-cliff pinning "
+                "stays off. Priority-0 first-request protection follows "
+                "VLLM_SESSION_TTL_LIMIT_S and remains advisory."
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -1345,7 +1351,8 @@ class Scheduler(SchedulerInterface):
                 "Suffix-preserving eviction enabled with eviction tiers of %d "
                 "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s, "
                 "idle_demote=%s, protect_tokens=%s, "
-                "session_dead_ttl_s=%s, detector=%s).",
+                "session_dead_ttl_s=%s, detector=%s, "
+                "session_ttl_limit_s=%s, session_ttl_k=%s).",
                 tier_tokens,
                 step_tokens or tier_tokens,
                 max_tiers or "uncapped",
@@ -1354,14 +1361,19 @@ class Scheduler(SchedulerInterface):
                 idle_protect_tokens or "off",
                 session_dead_ttl_s or "off",
                 session_detector if session_dead_ttl_s else "off",
+                session_ttl_limit_s or "off",
+                session_ttl_k if session_ttl_limit_s else "off",
             )
         else:
             logger.info(
                 "Suffix-preserving eviction enabled with prefix fraction %.2f "
-                "(idle_ttl_s=%s, session_dead_ttl_s=%s).",
+                "(idle_ttl_s=%s, session_dead_ttl_s=%s, "
+                "session_ttl_limit_s=%s, session_ttl_k=%s).",
                 fraction,
                 idle_ttl_s or "off",
                 session_dead_ttl_s or "off",
+                session_ttl_limit_s or "off",
+                session_ttl_k if session_ttl_limit_s else "off",
             )
 
     def _enable_system_prompt_pin(self) -> None:

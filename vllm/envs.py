@@ -1219,15 +1219,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
         os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
     ),
+    # Priority-0 session cap. 0 disables (default) and leaves suffix
+    # eviction plus the think-time detector unchanged. When set, a
+    # priority-0 session is stale after min(TTL_LIMIT, K * EWMA gap).
+    # The gap is completion to the next arrival. EWMA alpha is
+    # VLLM_SUFFIX_SESSION_EWA_ALPHA. Priorities 1+ keep ordinary tiered
+    # eviction. First-request hashes are advisory metadata: no extra ref,
+    # and GPU pressure may evict those blocks before the TTL.
     "VLLM_SESSION_TTL_LIMIT_S": lambda: float(
         os.getenv("VLLM_SESSION_TTL_LIMIT_S", "0")
     ),
     "VLLM_SESSION_TTL_K": lambda: float(os.getenv("VLLM_SESSION_TTL_K", "1")),
-    # Automatic system-prompt pinning. 0 disables (default). When on, the
-    # engine watches the first turn of N unique sessions, builds a monotone
-    # per-position share curve of leading block hashes, and pins the prefix
-    # up to the coverage cliff so those blocks never recompute. Independent
-    # of prefix-first eviction; compare pin vs no-pin vs native LRU.
+    # Legacy coverage-cliff system-prompt pinning. The scheduler does not
+    # turn this on; priority-0 sessions use VLLM_SESSION_TTL_LIMIT_S
+    # instead. 0 is the default. The detector remains available to tests.
     "VLLM_PIN_SYSTEM_PROMPT": lambda: bool(
         int(os.getenv("VLLM_PIN_SYSTEM_PROMPT", "0"))
     ),
