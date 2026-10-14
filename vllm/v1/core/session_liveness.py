@@ -61,6 +61,8 @@ class SessionLivenessState:
     ewa_gap: float = 0.0
     ewa_gap_sq: float = 0.0
     predicted_dead: bool = False
+    priority: int = 0
+    first_request_hashes: tuple[Any, ...] = ()
 
     @property
     def std(self) -> float:
@@ -80,9 +82,18 @@ class SessionLivenessTracker:
         detector: Detector = "ewa",
         quantile: float = 0.95,
         gap_window: int = 256,
+        session_ttl_limit_s: float = 0.0,
+        session_ttl_k: float = 1.0,
     ) -> None:
         if min_ttl_s < 0:
             raise ValueError(f"min_ttl_s must be >= 0, got {min_ttl_s}")
+        if session_ttl_limit_s < 0:
+            raise ValueError(
+                "session_ttl_limit_s must be >= 0, "
+                f"got {session_ttl_limit_s}"
+            )
+        if session_ttl_k < 0:
+            raise ValueError(f"session_ttl_k must be >= 0, got {session_ttl_k}")
         if not 0.0 < ewa_alpha <= 1.0:
             raise ValueError(f"ewa_alpha must be in (0, 1], got {ewa_alpha}")
         if dead_k < 0:
@@ -102,20 +113,32 @@ class SessionLivenessTracker:
         self.detector: Detector = detector
         self.quantile = quantile
         self.gap_window = gap_window
+        self.session_ttl_limit_s = session_ttl_limit_s
+        self.session_ttl_k = session_ttl_k
         self.states: dict[str, SessionLivenessState] = {}
         self._global_gaps: deque[float] = deque(maxlen=gap_window)
 
     @property
     def enabled(self) -> bool:
-        return self.min_ttl_s > 0
+        return self.min_ttl_s > 0 or self.session_ttl_limit_s > 0
 
-    def on_arrival(self, session_id: str | None, now: float) -> None:
+    def on_arrival(
+        self,
+        session_id: str | None,
+        now: float,
+        priority: int = 0,
+        first_request_hashes: tuple[Any, ...] = (),
+    ) -> None:
         if not session_id or not self.enabled:
             return
         state = self.states.setdefault(session_id, SessionLivenessState())
         if state.last_finish is not None:
             gap = max(0.0, now - state.last_finish)
             self._observe_gap(state, gap)
+        if state.last_arrival is None:
+            state.priority = priority
+            if priority == 0:
+                state.first_request_hashes = first_request_hashes
         state.last_arrival = now
         state.predicted_dead = False
 
@@ -125,7 +148,18 @@ class SessionLivenessTracker:
         state = self.states.setdefault(session_id, SessionLivenessState())
         state.last_finish = now
 
+    def adaptive_ttl(self, state: SessionLivenessState) -> float | None:
+        """Return the capped local TTL for an active priority-0 session."""
+        if self.session_ttl_limit_s <= 0 or state.priority != 0:
+            return None
+        if state.n_gaps == 0:
+            return self.session_ttl_limit_s
+        return min(self.session_ttl_limit_s, self.session_ttl_k * state.ewa_gap)
+
     def threshold(self, state: SessionLivenessState) -> float:
+        adaptive_ttl = self.adaptive_ttl(state)
+        if adaptive_ttl is not None:
+            return adaptive_ttl
         if self.detector == "global":
             if len(self._global_gaps) < self.min_gaps:
                 return self.min_ttl_s

@@ -703,6 +703,7 @@ class BlockPool:
                 block.session_id = None
                 block.evict_tier = None
                 block.idle_protect = False
+                block.session_protected = False
                 block.pinned = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
@@ -714,6 +715,7 @@ class BlockPool:
                 block.session_id = None
                 block.evict_tier = None
                 block.idle_protect = False
+                block.session_protected = False
                 block.pinned = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
@@ -794,6 +796,8 @@ class BlockPool:
         session_detector: str = "ewa",
         session_quantile: float = 0.95,
         session_gap_window: int = 256,
+        session_ttl_limit_s: float = 0.0,
+        session_ttl_k: float = 1.0,
         idle_demote: str = "all",
         idle_protect_len: int = 0,
     ) -> None:
@@ -830,6 +834,8 @@ class BlockPool:
             detector=session_detector,  # type: ignore[arg-type]
             quantile=session_quantile,
             gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
         )
         # Overridable clock for tests / CPU simulator (defaults to wall time).
         if not hasattr(self, "_time_fn"):
@@ -867,6 +873,7 @@ class BlockPool:
             return 0
         for block in to_promote:
             queue.remove(block)
+            block.session_protected = False
         queue.prepend_n_to_tier(to_promote, 0)
         tracker.mark_promoted(dead)
         return len(to_promote)
@@ -913,6 +920,17 @@ class BlockPool:
                 continue
             block.freed_at = now
             block.session_id = session_id
+            first_hashes = (
+                self.session_tracker.states[session_id].first_request_hashes
+                if session_id is not None
+                and session_id in self.session_tracker.states
+                else ()
+            )
+            block.session_protected = (
+                bool(first_hashes)
+                and block.block_hash is not None
+                and get_block_hash(block.block_hash) in first_hashes
+            )
             block.idle_protect = idx >= protect_from and protect_from < len(blocks)
             if idx < first_tier_len:
                 block.evict_tier = 0

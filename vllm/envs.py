@@ -310,6 +310,8 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
     VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
     VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
+    VLLM_SESSION_TTL_LIMIT_S: float = 0.0
+    VLLM_SESSION_TTL_K: float = 1.0
     VLLM_PIN_SYSTEM_PROMPT: bool = False
     VLLM_PIN_MIN_REQUESTS: int = 8
     VLLM_PIN_SHARE: float = 0.75
@@ -1217,6 +1219,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
         os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
     ),
+    "VLLM_SESSION_TTL_LIMIT_S": lambda: float(
+        os.getenv("VLLM_SESSION_TTL_LIMIT_S", "0")
+    ),
+    "VLLM_SESSION_TTL_K": lambda: float(os.getenv("VLLM_SESSION_TTL_K", "1")),
     # Automatic system-prompt pinning. 0 disables (default). When on, the
     # engine watches the first turn of N unique sessions, builds a monotone
     # per-position share curve of leading block hashes, and pins the prefix
@@ -2305,6 +2311,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_SESSION_DETECTOR",
         "VLLM_SUFFIX_SESSION_QUANTILE",
         "VLLM_SUFFIX_SESSION_GAP_WINDOW",
+        "VLLM_SESSION_TTL_LIMIT_S",
+        "VLLM_SESSION_TTL_K",
         "VLLM_PIN_SYSTEM_PROMPT",
         "VLLM_PIN_MIN_REQUESTS",
         "VLLM_PIN_SHARE",

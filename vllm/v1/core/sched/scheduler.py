@@ -292,8 +292,9 @@ class Scheduler(SchedulerInterface):
         self._suffix_hits: dict[str, tuple[int, int]] = {}
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
-        if envs.VLLM_PIN_SYSTEM_PROMPT:
-            self._enable_system_prompt_pin()
+        # Session-aware first-request protection is integrated into the
+        # suffix-preserving eviction path; do not activate the legacy global
+        # coverage-based hard pinning path by default.
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -1277,6 +1278,8 @@ class Scheduler(SchedulerInterface):
         session_detector = envs.VLLM_SUFFIX_SESSION_DETECTOR
         session_quantile = envs.VLLM_SUFFIX_SESSION_QUANTILE
         session_gap_window = envs.VLLM_SUFFIX_SESSION_GAP_WINDOW
+        session_ttl_limit_s = envs.VLLM_SESSION_TTL_LIMIT_S
+        session_ttl_k = envs.VLLM_SESSION_TTL_K
         idle_demote = envs.VLLM_SUFFIX_EVICTION_IDLE_DEMOTE
         idle_protect_tokens = envs.VLLM_SUFFIX_EVICTION_PROTECT_TOKENS
         if tier_tokens < 0 or step_tokens < 0:
@@ -1287,6 +1290,10 @@ class Scheduler(SchedulerInterface):
             raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
         if session_dead_ttl_s < 0:
             raise ValueError("VLLM_SUFFIX_SESSION_DEAD_TTL_S must not be negative")
+        if session_ttl_limit_s < 0:
+            raise ValueError("VLLM_SESSION_TTL_LIMIT_S must not be negative")
+        if session_ttl_k < 0:
+            raise ValueError("VLLM_SESSION_TTL_K must not be negative")
         if not 0.0 < session_ewa_alpha <= 1.0:
             raise ValueError(
                 "VLLM_SUFFIX_SESSION_EWA_ALPHA must be in (0, 1], "
@@ -1328,6 +1335,8 @@ class Scheduler(SchedulerInterface):
             session_detector=session_detector,
             session_quantile=session_quantile,
             session_gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
             idle_demote=idle_demote,
             idle_protect_tokens=idle_protect_tokens,
         )

@@ -208,6 +208,8 @@ class KVCacheManager:
         session_detector: str = "ewa",
         session_quantile: float = 0.95,
         session_gap_window: int = 256,
+        session_ttl_limit_s: float = 0.0,
+        session_ttl_k: float = 1.0,
         idle_demote: str = "all",
         idle_protect_tokens: int = 0,
     ) -> None:
@@ -280,6 +282,13 @@ class KVCacheManager:
             raise ValueError(
                 f"session_dead_ttl_s must be >= 0, got {session_dead_ttl_s}"
             )
+        if session_ttl_limit_s < 0:
+            raise ValueError(
+                "session_ttl_limit_s must be >= 0, "
+                f"got {session_ttl_limit_s}"
+            )
+        if session_ttl_k < 0:
+            raise ValueError(f"session_ttl_k must be >= 0, got {session_ttl_k}")
         if session_detector not in ("ewa", "global"):
             raise ValueError(
                 f"session_detector must be 'ewa' or 'global', got {session_detector}"
@@ -304,6 +313,8 @@ class KVCacheManager:
             session_detector=session_detector,
             session_quantile=session_quantile,
             session_gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
             idle_demote=idle_demote,
             idle_protect_len=idle_protect_len,
         )
@@ -360,6 +371,10 @@ class KVCacheManager:
             tracker.on_arrival(
                 request.session_id,
                 getattr(self.block_pool, "_time_fn", time.monotonic)(),
+                priority=request.priority,
+                first_request_hashes=tuple(request.block_hashes)
+        if request.priority == 0
+        else (),
             )
         self.note_prefix_for_pin(request)
 
