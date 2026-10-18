@@ -258,6 +258,9 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # Later CPU runs that are not contiguous with the GPU cursor.
+    # Empty for lru and arc.
+    offload_spans: list[tuple[int, int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -349,9 +352,13 @@ class RequestOffloadState:
 
 
 def _create_req_context(req: Request) -> ReqContext:
+    priority = 0 if req.priority is None else req.priority
     return ReqContext(
         req_id=req.request_id,
         kv_transfer_params=req.kv_transfer_params,
+        session_id=req.session_id,
+        priority=priority,
+        block_hashes=tuple(req.block_hashes),
     )
 
 
@@ -455,6 +462,23 @@ class OffloadingConnectorScheduler:
             num = min(num, req_status.req.num_prompt_tokens)
         return num
 
+    def _note_finished_recency(self, req_status: RequestOffloadState) -> None:
+        """Record LRU/ARC order once the request's keys are stored.
+
+        Call this from request_finished, while the request is still the
+        newest one. This branch then drops the request as soon as its last
+        store job finishes, so the finished-request loop often never sees it.
+        A later call would move that request ahead of one already being stored.
+        """
+        if self._refreshes_recency_from_connector():
+            return
+        note_finished = getattr(self.manager, "note_finished_keys", None)
+        if note_finished is None:
+            return
+        for group_state in req_status.group_states:
+            if group_state.offload_keys:
+                note_finished(group_state.offload_keys, req_status.req_context)
+
     def _maybe_cleanup_finished_req(
         self, req_id: str, req_status: RequestOffloadState
     ) -> None:
@@ -517,7 +541,62 @@ class OffloadingConnectorScheduler:
                 return idx + sliding_window_size if not defer_lookup else None
         return consecutive_hits if not defer_lookup else None
 
+    def _span_lookup(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> tuple[int | None, list[tuple[int, int]]]:
+        """Cached runs in ``keys``.
+
+        The first element is the length of the run that starts at index 0,
+        or None when a lookup must be retried. Later ``[start, end)`` runs
+        are the holes the scheduler recomputes before loading. LRU and ARC
+        do not call this.
+        """
+        runs: list[tuple[int, int]] = []
+        start: int | None = None
+        defer = False
+        for index, key in enumerate(keys):
+            match self.manager.lookup(key, req_context):
+                case LookupResult.HIT | LookupResult.HIT_PENDING:
+                    if start is None:
+                        start = index
+                case LookupResult.RETRY:
+                    defer = True
+                    if start is not None:
+                        runs.append((start, index))
+                        start = None
+                case LookupResult.MISS:
+                    if start is not None:
+                        runs.append((start, index))
+                        start = None
+        if start is not None:
+            runs.append((start, len(keys)))
+        if defer:
+            return None, []
+        if runs and runs[0][0] == 0:
+            return runs[0][1], runs[1:]
+        return 0, runs
+
+    def take_offload_spans(self, request: Request) -> list[tuple[int, int]]:
+        """Pop CPU runs that sit behind a hole. Empty for lru and arc."""
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or not req_status.offload_spans:
+            return []
+        spans = req_status.offload_spans
+        req_status.offload_spans = []
+        return spans
+
+    def _refreshes_recency_from_connector(self) -> bool:
+        return bool(getattr(self.manager, "refreshes_recency_from_connector", True))
+
     def _touch(self, req_status: RequestOffloadState):
+        positions: dict[OffloadKey, int] = {}
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            for index, key in enumerate(group_state.offload_keys):
+                positions[key] = index * tokens_per_chunk
+        req_status.req_context.token_positions = positions
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
@@ -614,7 +693,16 @@ class OffloadingConnectorScheduler:
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
-                if sliding_window_size_in_chunks is None:
+                later_spans: list[tuple[int, int]] = []
+                use_spans = (
+                    sliding_window_size_in_chunks is None
+                    and getattr(self.manager, "supports_disjoint_spans", False)
+                )
+                if use_spans:
+                    num_hit_chunks, later_spans = self._span_lookup(
+                        offload_keys, req_status.req_context
+                    )
+                elif sliding_window_size_in_chunks is None:
                     num_hit_chunks = self._maximal_prefix_lookup(
                         offload_keys, req_status.req_context
                     )
@@ -627,11 +715,22 @@ class OffloadingConnectorScheduler:
                         required_window,
                         req_status.req_context,
                     )
-                if num_hit_chunks == 0:
+                if num_hit_chunks == 0 and not later_spans:
                     return 0
+                for start, end in later_spans:
+                    req_status.offload_spans.append(
+                        (
+                            (start_chunk_idx + start) * tokens_per_chunk,
+                            (start_chunk_idx + end) * tokens_per_chunk,
+                        )
+                    )
 
                 if num_hit_chunks is None:
                     defer_lookup = True
+                elif num_hit_chunks == 0:
+                    # A hole sits in front of a later CPU run. The contiguous
+                    # external count stays 0; the spans were recorded above.
+                    max_hit_size_tokens = num_computed_tokens
                 else:
                     if is_eagle_unverified:
                         num_hit_chunks -= 1
@@ -770,7 +869,8 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
-        self._touch(req_status)
+        if self._refreshes_recency_from_connector():
+            self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
 
@@ -1016,7 +1116,8 @@ class OffloadingConnectorScheduler:
                 self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
-            self._touch(req_status)
+            if self._refreshes_recency_from_connector():
+                self._touch(req_status)
 
             keys_to_store = set(store_output.keys_to_store)
 
@@ -1157,6 +1258,17 @@ class OffloadingConnectorScheduler:
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+
+        # All prepare_store calls for finished requests have been issued.
+        # Signal on_request_finished and clean up state where possible.
+        for req_id in scheduler_output.finished_req_ids or ():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            req_status.finished_signaled = True
+            self.manager.on_request_finished(req_status.req_context)
+            if not req_status.transfer_jobs:
+                del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -1295,6 +1407,7 @@ class OffloadingConnectorScheduler:
         # Update offload keys with final block hash so _build_store_jobs can
         # create store jobs for the last block(s) on the next schedule step.
         req_status.update_offload_keys()
+        self._note_finished_recency(req_status)
 
         # Keep req_status alive: _build_store_jobs will process finished_req_ids
         # on the next step and handle cleanup after creating store jobs.

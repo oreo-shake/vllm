@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
-from typing import Literal
+from collections.abc import Collection, Iterable, Mapping
+from typing import Any
 
 from typing_extensions import override
 
@@ -27,10 +27,18 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.prefix import (
+    FirstRequestPinCachePolicy,
+    PrefixPruningCachePolicy,
+    PrefixPruningOnSessionsCachePolicy,
+)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "prefix_pruning": PrefixPruningCachePolicy,
+    "prefix_pruning_on_sessions": PrefixPruningOnSessionsCachePolicy,
+    "first_request_pin": FirstRequestPinCachePolicy,
 }
 
 
@@ -47,10 +55,11 @@ class CPUOffloadingManager(OffloadingManager):
     def __init__(
         self,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: str = "lru",
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        policy_kwargs: Mapping[str, Any] | None = None,
     ):
         self.medium: str = MEDIUM_CPU
         self._num_blocks: int = num_blocks
@@ -63,7 +72,12 @@ class CPUOffloadingManager(OffloadingManager):
                 f"Unknown cache policy: {cache_policy!r}. "
                 f"Supported: {list(_CACHE_POLICIES)}"
             )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        # LRU and ARC take only the capacity. Tier sizes are not forwarded,
+        # so their eviction order stays the one those classes implement.
+        if cache_policy in ("lru", "arc"):
+            self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        else:
+            self._policy = policy_cls(num_blocks, **dict(policy_kwargs or {}))
         # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
@@ -114,6 +128,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._policy.on_new_request(req_context)
         return RequestOffloadingContext()
 
     @override
@@ -134,6 +149,20 @@ class CPUOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     @override
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._policy.on_request_finished(req_context)
+
+    @property
+    def supports_disjoint_spans(self) -> bool:
+        return self._policy.supports_disjoint_spans
+
+    def attach_session_tracker(self, tracker: object) -> None:
+        """Share the GPU idle-gap record. LRU and ARC ignore it."""
+        hook = getattr(self._policy, "attach_session_tracker", None)
+        if hook is not None:
+            hook(tracker)
+
+    @override
     def prepare_load(
         self,
         keys: Collection[OffloadKey],
@@ -151,6 +180,15 @@ class CPUOffloadingManager(OffloadingManager):
             block.ref_cnt += 1
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
+
+    @property
+    def refreshes_recency_from_connector(self) -> bool:
+        return self._policy.refreshes_recency_from_connector
+
+    def note_finished_keys(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self._policy.note_finished_keys(keys, req_context)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -231,6 +269,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
+        self._policy.note_stored(keys_to_store, req_context)
         self._num_write_pending_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks

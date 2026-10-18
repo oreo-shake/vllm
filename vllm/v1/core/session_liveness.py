@@ -17,11 +17,17 @@ Two detectors:
   short thinks cannot make that session look dead; the bar is "longer
   than almost every think we have seen on this server."
 
-Priority 0 can opt into a separate cap, ``min(TTL_limit, K · EWMA gap)``.
+Priority 0 can opt into a separate bound, ``max(TTL_limit, K · EWMA gap)``.
 The gap is completion to the next arrival. ``TTL_limit <= 0`` leaves this
 off, so the detectors above are unchanged. Priorities 1+ do not use the
 cap; with the think-time floor also at 0 they are never predicted dead.
-The priority check is the extension point for later policies.
+
+A request that omits ``priority`` is priority 0. ``pin_first_request``
+is separate from prefix tiers and from the think-time detector. It is
+on only when the priority-0 TTL cap is configured. Then that session's
+first request keeps its block hashes until the session is predicted
+dead. Priorities 1+ do not. The priority check is the extension point
+for later policies.
 """
 
 from __future__ import annotations
@@ -102,6 +108,8 @@ class SessionLivenessTracker:
         gap_window: int = 256,
         session_ttl_limit_s: float = 0.0,
         session_ttl_k: float = 1.0,
+        pin_first_request: bool = False,
+        observe_idle: bool = False,
     ) -> None:
         if min_ttl_s < 0:
             raise ValueError(f"min_ttl_s must be >= 0, got {min_ttl_s}")
@@ -133,12 +141,22 @@ class SessionLivenessTracker:
         self.gap_window = gap_window
         self.session_ttl_limit_s = session_ttl_limit_s
         self.session_ttl_k = session_ttl_k
+        self.pin_first_request = pin_first_request
+        # Record completion-to-arrival gaps without changing eviction.
+        # Used when this tier is LRU but another tier's policy needs the
+        # session's idle moving average.
+        self.observe_idle = observe_idle
         self.states: dict[str, SessionLivenessState] = {}
         self._global_gaps: deque[float] = deque(maxlen=gap_window)
 
     @property
     def enabled(self) -> bool:
-        return self.min_ttl_s > 0 or self.session_ttl_limit_s > 0
+        return (
+            self.min_ttl_s > 0
+            or self.session_ttl_limit_s > 0
+            or self.pin_first_request
+            or self.observe_idle
+        )
 
     def on_arrival(
         self,
@@ -161,7 +179,7 @@ class SessionLivenessTracker:
             state.priority = priority
             if (
                 priority == 0
-                and self.session_ttl_limit_s > 0
+                and (self.session_ttl_limit_s > 0 or self.pin_first_request)
                 and first_request_hashes
             ):
                 state.first_request_hashes = first_request_hashes
@@ -184,7 +202,7 @@ class SessionLivenessTracker:
         # Arrival usually has the prompt prefix. If that snapshot was empty,
         # the first completion can still seal it before blocks are freed.
         if (
-            self.session_ttl_limit_s > 0
+            (self.session_ttl_limit_s > 0 or self.pin_first_request)
             and state.priority == 0
             and state.n_requests == 1
             and state.first_arrival is not None
@@ -194,17 +212,18 @@ class SessionLivenessTracker:
             state.first_request_hashes = block_hashes
 
     def adaptive_ttl(self, state: SessionLivenessState) -> float | None:
-        """Return ``min(TTL_limit, K · EWMA)`` for an active priority-0 session.
+        """Return ``max(TTL_limit, K · EWMA)`` for an active priority-0 session.
 
         ``None`` means this session stays on the ordinary think-time
-        detector (priorities 1+, or the cap env left at 0). With no
-        observed gap yet, the cap itself is the TTL.
+        detector (priorities 1+, or the bound left at 0). With no
+        observed gap yet, the tier bound itself is the TTL. After a gap,
+        an outlier average raises the TTL above that bound.
         """
         if self.session_ttl_limit_s <= 0 or state.priority != 0:
             return None
         if state.n_gaps == 0:
             return self.session_ttl_limit_s
-        return min(self.session_ttl_limit_s, self.session_ttl_k * state.ewa_gap)
+        return max(self.session_ttl_limit_s, self.session_ttl_k * state.ewa_gap)
 
     def first_request_hashes_for(
         self, session_id: str | None, now: float
@@ -215,7 +234,9 @@ class SessionLivenessTracker:
         priority 0, and it has not gone stale. Idle expiry marks the
         session stale and drops the metadata. A later arrival revives it.
         """
-        if self.session_ttl_limit_s <= 0 or not session_id:
+        if not session_id:
+            return ()
+        if self.session_ttl_limit_s <= 0 and not self.pin_first_request:
             return ()
         state = self.states.get(session_id)
         if (
@@ -245,6 +266,50 @@ class SessionLivenessTracker:
         if state.n_gaps < self.min_gaps:
             return self.min_ttl_s
         return max(self.min_ttl_s, state.ewa_gap + self.dead_k * state.std)
+
+    def idle_limit(
+        self, session_id: str | None, scale: float, floor_s: float = 0.0
+    ) -> float | None:
+        """``scale`` times this session's idle-gap EWMA.
+
+        ``None`` means the session has no gap yet and no positive floor,
+        so a caller must not treat it as expired. A positive ``floor_s``
+        is the limit until the first gap, and a lower bound after that.
+        """
+        if not session_id:
+            return None
+        state = self.states.get(session_id)
+        if state is None or state.n_gaps == 0:
+            return floor_s if floor_s > 0 else None
+        limit = scale * state.ewa_gap
+        if floor_s > 0:
+            limit = max(floor_s, limit)
+        return limit
+
+    def idle_expired(
+        self,
+        session_id: str | None,
+        now: float,
+        scale: float,
+        floor_s: float = 0.0,
+    ) -> bool:
+        """True when the session has been idle for ``scale * ewa`` seconds.
+
+        A turn still in flight is not expired. Observation-only trackers
+        use this instead of ``is_dead``, which stays false while no dead
+        detector is configured.
+        """
+        if not session_id:
+            return False
+        state = self.states.get(session_id)
+        if state is None or state.last_finish is None:
+            return False
+        if state.last_arrival is not None and state.last_arrival >= state.last_finish:
+            return False
+        limit = self.idle_limit(session_id, scale, floor_s)
+        if limit is None:
+            return False
+        return (now - state.last_finish) >= limit
 
     def is_dead(self, session_id: str, now: float) -> bool:
         if not self.enabled:

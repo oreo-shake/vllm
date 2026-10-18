@@ -47,6 +47,10 @@ class ARCCachePolicy(CachePolicy):
         - B2 hit: Frequent access patterns matter more → decrease T1.
     """
 
+    # A store is not a second access. The connector must not promote T1 to T2
+    # on every lookup and store; recency is restored once when the request ends.
+    refreshes_recency_from_connector = False
+
     def __init__(self, cache_capacity: int):
         self.cache_capacity: int = cache_capacity
         self.target_t1_size: float = 0.0
@@ -70,6 +74,17 @@ class ARCCachePolicy(CachePolicy):
     def remove(self, key: OffloadKey) -> None:
         if self.t1.pop(key, None) is None:
             self.t2.pop(key, None)
+
+    @override
+    def note_finished_keys(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        # Keep T1 membership. Reverse order leaves the head most recent.
+        for key in reversed(list(keys)):
+            if key in self.t1:
+                self.t1.move_to_end(key)
+            elif key in self.t2:
+                self.t2.move_to_end(key)
 
     @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:

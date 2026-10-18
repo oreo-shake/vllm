@@ -1,0 +1,8 @@
+# Change "latest" to your specific version tag
+FROM vllm/vllm-openai:v0.26.0
+
+# Delete all old Python files to prevent ghost-file conflicts
+RUN find /usr/local/lib/python3.12/dist-packages/vllm/ -name "*.py" -type f -delete
+
+# Hot-swap your modified Python code
+COPY ./vllm /usr/local/lib/python3.12/dist-packages/vllm/

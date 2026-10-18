@@ -312,6 +312,8 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
     VLLM_SESSION_TTL_LIMIT_S: float = 0.0
     VLLM_SESSION_TTL_K: float = 1.0
+    VLLM_CPU_SESSION_TTL_S: str = ""
+    VLLM_CPU_SESSION_TTL_K: float = 2.0
     VLLM_PIN_SYSTEM_PROMPT: bool = False
     VLLM_PIN_MIN_REQUESTS: int = 8
     VLLM_PIN_SHARE: float = 0.75
@@ -1221,7 +1223,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Priority-0 session cap. 0 disables (default) and leaves suffix
     # eviction plus the think-time detector unchanged. When set, a
-    # priority-0 session is stale after min(TTL_LIMIT, K * EWMA gap).
+    # priority-0 session is stale after max(TTL_LIMIT, K * EWMA gap).
     # The gap is completion to the next arrival. EWMA alpha is
     # VLLM_SUFFIX_SESSION_EWA_ALPHA. Priorities 1+ keep ordinary tiered
     # eviction. First-request hashes are advisory metadata: no extra ref,
@@ -1230,6 +1232,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SESSION_TTL_LIMIT_S", "0")
     ),
     "VLLM_SESSION_TTL_K": lambda: float(os.getenv("VLLM_SESSION_TTL_K", "1")),
+    # CPU tier bound in max(K * idle EWMA, bound). Empty means no bound.
+    # K multiplies the session's own idle-gap average. It does not scale
+    # the GPU TTL. CPU LRU and ARC do not read either value.
+    "VLLM_CPU_SESSION_TTL_S": lambda: os.getenv("VLLM_CPU_SESSION_TTL_S", ""),
+    "VLLM_CPU_SESSION_TTL_K": lambda: float(
+        os.getenv("VLLM_CPU_SESSION_TTL_K", "2")
+    ),
     # Legacy coverage-cliff system-prompt pinning. The scheduler does not
     # turn this on; priority-0 sessions use VLLM_SESSION_TTL_LIMIT_S
     # instead. 0 is the default. The detector remains available to tests.
@@ -2318,6 +2327,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_SESSION_GAP_WINDOW",
         "VLLM_SESSION_TTL_LIMIT_S",
         "VLLM_SESSION_TTL_K",
+        "VLLM_CPU_SESSION_TTL_S",
+        "VLLM_CPU_SESSION_TTL_K",
         "VLLM_PIN_SYSTEM_PROMPT",
         "VLLM_PIN_MIN_REQUESTS",
         "VLLM_PIN_SHARE",

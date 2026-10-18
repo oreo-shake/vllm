@@ -150,8 +150,8 @@ class KVCacheBlock:
     # Last N tokens of this request. Idle-TTL must not dump these to tier 0
     # (session-dead wipe still may). Lets a long think keep a suffix hit.
     idle_protect: bool = False
-    # Best-effort protection for a priority-0 session's first request. This is
-    # metadata only; the block remains an ordinary queue eviction candidate.
+    # Priority-0 first request (the default when the body omits priority).
+    # The free queue evicts these only after every unprotected free block.
     session_protected: bool = False
     # Extra ref held by automatic system-prompt pinning. Pinned blocks stay
     # out of the free queue so the shared prefix is never recomputed.
@@ -489,6 +489,15 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
         if n == 0:
             return []
         assert self.num_free_blocks >= n
+        # Priority-0 first-request blocks stay until nothing else is free.
+        ordered = list(self.iter_blocks_after(None))
+        if any(block.session_protected for block in ordered):
+            preferred = [block for block in ordered if not block.session_protected]
+            deferred = [block for block in ordered if block.session_protected]
+            chosen = (preferred + deferred)[:n]
+            for block in chosen:
+                self.remove(block)
+            return chosen
         self.num_free_blocks -= n
 
         passed_boundaries: list[KVCacheBlock] = []

@@ -18,38 +18,64 @@ class LRUCachePolicy(CachePolicy):
      - touch
     """
 
+    # The connector must not touch every key while the request is in flight.
+    # That walk is reversed and makes the tail the eviction victim. Recency
+    # is updated once, when the request finishes.
+    refreshes_recency_from_connector = False
+
     def __init__(self, cache_capacity: int):
-        # Blocks with ref_cnt 0 (not participating in any loads/stores) ordered in LRU
+        super().__init__(cache_capacity)
+        # Blocks with ref_cnt 0 (not participating in any loads/stores).
+        # Eviction order is _rank, not this dict's order: a store that
+        # completes late must not become newer than one inserted earlier.
         self.evictable_blocks: OrderedDict[OffloadKey, None] = OrderedDict()
         self.blocks: dict[OffloadKey, BlockStatus] = {}
+        self._rank: dict[OffloadKey, int] = {}
+        self._next_rank = 0
 
     @override
     def get(self, key: OffloadKey) -> BlockStatus | None:
         return self.blocks.get(key)
 
+    def _bump(self, key: OffloadKey) -> None:
+        self._rank[key] = self._next_rank
+        self._next_rank += 1
+
     @override
     def insert(self, key: OffloadKey, block: BlockStatus) -> None:
         self.blocks[key] = block
+        self._bump(key)
         if block.ref_cnt == 0:
             self.evictable_blocks[key] = None
 
     @override
     def remove(self, key: OffloadKey) -> None:
         del self.blocks[key]
+        self._rank.pop(key, None)
         self.evictable_blocks.pop(key, None)
 
     @override
+    def note_finished_keys(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self.touch(keys, req_context)
+
+    @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+        # Reverse so the first key, the head of the request, ends newest.
         for key in reversed(list(keys)):
+            if key not in self._rank:
+                continue
+            self._bump(key)
             if key in self.evictable_blocks:
                 self.evictable_blocks.move_to_end(key)
-            # active blocks are untouched as they are non-evictable now. They
-            # will eventually reach the end of evictable_blocks when they finish.
 
     @override
     def clear(self) -> None:
         self.evictable_blocks.clear()
         self.blocks.clear()
+        self._rank.clear()
+        self._next_rank = 0
 
     @override
     def evict(
@@ -58,22 +84,20 @@ class LRUCachePolicy(CachePolicy):
         if n == 0:
             return []
 
+        ranked = sorted(
+            (key for key in self.evictable_blocks if key not in protected),
+            key=self._rank.__getitem__,
+        )
+        if len(ranked) < n:
+            return None
         candidates: list[tuple[OffloadKey, BlockStatus]] = []
-        for key, _ in self.evictable_blocks.items():
-            if key in protected:
-                continue
-
+        for key in ranked[:n]:
             block = self.blocks[key]
             assert block.ref_cnt == 0
             candidates.append((key, block))
-            if len(candidates) == n:
-                break
-
-        if len(candidates) < n:
-            return None
-        for key, _ in candidates:
             del self.evictable_blocks[key]
             del self.blocks[key]
+            del self._rank[key]
         return candidates
 
     @override

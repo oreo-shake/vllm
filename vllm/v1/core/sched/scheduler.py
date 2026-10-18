@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.session_liveness import SessionLivenessTracker
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -290,8 +291,20 @@ class Scheduler(SchedulerInterface):
         # {req_id: (gap_end, suffix_end)} in tokens, for scheduled requests
         # admitted with a suffix hit that have not computed their gap yet.
         self._suffix_hits: dict[str, tuple[int, int]] = {}
+        # CPU runs that start after a hole. Absent for lru and arc.
+        self._offload_spans: dict[str, list[tuple[int, int]]] = {}
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
+        elif self._cpu_policy_needs_idle_average():
+            # GPU stays on LRU. Record session idle gaps so a CPU policy
+            # can use them. The free queue is not replaced.
+            self.kv_cache_manager.block_pool.session_tracker = (
+                SessionLivenessTracker(observe_idle=True)
+            )
+        if self.connector is not None:
+            attach = getattr(self.connector, "attach_session_tracker", None)
+            if attach is not None:
+                attach(self.kv_cache_manager.block_pool.session_tracker)
         # Coverage-cliff system-prompt pinning is not the default path.
         # Priority-0 first-request metadata lives on the suffix-preserving
         # tracker and does not take an extra reference count.
@@ -515,10 +528,16 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if self._requeue_for_offload_span(request, req_index):
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
+            )
+            num_new_tokens = self._clip_to_offload_span(
+                request, num_new_tokens, request.num_computed_tokens
             )
             if (suffix_hit := self._suffix_hits.get(request.request_id)) is not None:
                 num_new_tokens = min(
@@ -805,6 +824,13 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        take_spans = getattr(self.connector, "take_offload_spans", None)
+                        if take_spans is not None:
+                            spans = take_spans(request)
+                            if spans:
+                                self._offload_spans.setdefault(
+                                    request.request_id, []
+                                ).extend(spans)
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -847,6 +873,24 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                    # A CPU run sits at this cursor. The first lookup only
+                    # runs when num_computed_tokens == 0, so a request that
+                    # was requeued after recomputing the hole must ask again
+                    # or the span is never loaded.
+                    span_load = self._match_offload_span(request, num_computed_tokens)
+                    if span_load is not None:
+                        ext_tokens, span_async = span_load
+                        if ext_tokens is None:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        num_external_computed_tokens = ext_tokens
+                        load_kv_async = span_async
+                        num_computed_tokens = num_computed_tokens + ext_tokens
+                        connector_prefix_cache_queries = (
+                            request.num_tokens - request.num_computed_tokens
+                        )
+                        connector_prefix_cache_hits = ext_tokens
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -869,6 +913,9 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     if suffix_hit is not None:
                         num_new_tokens = suffix_hit[0] - num_computed_tokens
+                    num_new_tokens = self._clip_to_offload_span(
+                        request, num_new_tokens, num_computed_tokens
+                    )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -2454,11 +2501,119 @@ class Scheduler(SchedulerInterface):
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
 
+    def _cpu_policy_needs_idle_average(self) -> bool:
+        """True when the CPU tier is not LRU or ARC.
+
+        Those two policies do not read session idle time. Any other CPU
+        policy needs the GPU-side gap average, including when GPU eviction
+        itself stays LRU.
+        """
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is None:
+            return False
+        policy = transfer.get_from_extra_config("eviction_policy", "lru")
+        return policy not in ("lru", "arc")
+
+    def _requeue_for_offload_span(self, request: Request, req_index: int) -> bool:
+        """Send a request back to waiting so a CPU run can load contiguously.
+
+        LRU and ARC never fill ``_offload_spans``, so this is a no-op for them.
+        The GPU suffix jump is a different path and is not used here.
+        """
+        spans = self._offload_spans.get(request.request_id)
+        if not spans or request.num_in_flight_tokens != 0:
+            return False
+        start, end = spans[0]
+        if request.num_computed_tokens >= end:
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._requeue_for_offload_span(request, req_index)
+        if request.num_computed_tokens < start:
+            return False
+        self.running.pop(req_index)
+        request.status = RequestStatus.WAITING
+        self.waiting.prepend_request(request)
+        return True
+
+    def _match_offload_span(
+        self, request: Request, num_computed: int
+    ) -> tuple[int | None, bool] | None:
+        """Load a CPU run that the request has already reached.
+
+        Returns None when no span is waiting at this cursor. Otherwise
+        returns the connector's ``(external_tokens, load_async)``. A run
+        the connector will not load is dropped so the scheduler recomputes
+        it instead of scheduling zero tokens.
+        """
+        spans = self._offload_spans.get(request.request_id)
+        if self.connector is None or not spans or num_computed < spans[0][0]:
+            return None
+        ext_tokens, load_async = self.connector.get_num_new_matched_tokens(
+            request, num_computed
+        )
+        take_spans = getattr(self.connector, "take_offload_spans", None)
+        if take_spans is not None:
+            extra = take_spans(request)
+            if extra:
+                self._offload_spans.setdefault(request.request_id, []).extend(extra)
+                spans = self._offload_spans[request.request_id]
+        if ext_tokens is None:
+            return None, False
+        if ext_tokens > 0:
+            loaded_until = num_computed + ext_tokens
+            while spans and spans[0][0] < loaded_until:
+                start, end = spans[0]
+                if end > loaded_until:
+                    spans[0] = (loaded_until, end)
+                    break
+                spans.pop(0)
+        else:
+            spans.pop(0)
+        if not spans:
+            self._offload_spans.pop(request.request_id, None)
+        return ext_tokens, load_async
+
+    def _clip_to_offload_span(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_computed: int,
+        pause: bool = False,
+    ) -> int:
+        """Stop a prefill chunk at the next CPU run so the hole is recomputed."""
+        spans = self._offload_spans.get(request.request_id)
+        if not spans or num_new_tokens <= 0:
+            return num_new_tokens
+        start, end = spans[0]
+        if num_computed >= end:
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._clip_to_offload_span(
+                request, num_new_tokens, num_computed, pause
+            )
+        if num_computed >= start:
+            # Inside a cached CPU run. The running loop must not compute
+            # into it while earlier tokens are still in flight; it pauses
+            # until the requeue can load the run. The waiting path never
+            # pauses: a run left here is recomputed.
+            if pause:
+                return 0
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._clip_to_offload_span(
+                request, num_new_tokens, num_computed, pause
+            )
+        return min(num_new_tokens, start - num_computed)
+
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
         self._suffix_hits.pop(request.request_id, None)
+        self._offload_spans.pop(request.request_id, None)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.

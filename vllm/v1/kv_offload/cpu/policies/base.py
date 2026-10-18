@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
@@ -39,7 +39,19 @@ class CachePolicy(ABC):
     decisions (which block to evict). LRU and ARC differ in both dimensions —
     ARC's ghost lists and target_t1_size live at the intersection of storage
     and eviction, so they cannot be separated cleanly.
+
+    ``supports_disjoint_spans`` stays false for LRU and ARC. Lookup then
+    remains one contiguous run. Prefix and first-request policies set it
+    so a later cached run can be loaded after the hole in front of it is
+    recomputed.
     """
+
+    supports_disjoint_spans: bool = False
+
+    # The connector refreshes recency on lookup and store when this is set.
+    # LRU records recency at insertion and when a store completes, so a
+    # refresh of every key inverts that order and evicts the tail.
+    refreshes_recency_from_connector: bool = True
 
     @abstractmethod
     def __init__(self, cache_capacity: int) -> None: ...
@@ -55,6 +67,16 @@ class CachePolicy(ABC):
     @abstractmethod
     def remove(self, key: OffloadKey) -> None:
         """Remove a block (used to clean up after a failed store)."""
+
+    def note_finished_keys(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Refresh recency once, after the request has finished storing.
+
+        The default is a no-op. LRU and ARC override this. A per-step touch
+        is a different event: for ARC it means a reuse, not a store.
+        """
+        return
 
     @abstractmethod
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
@@ -88,6 +110,43 @@ class CachePolicy(ABC):
 
         Ghost lists and adaptive state are also reset.
         """
+
+    def cached_spans(
+        self, keys: Sequence[OffloadKey]
+    ) -> list[tuple[int, int]] | None:
+        """Cached runs as ``[start, end)`` indexes into ``keys``.
+
+        ``None`` means this policy does not describe holes. The connector
+        keeps the contiguous prefix scan. An empty list means nothing in
+        ``keys`` is cached.
+        """
+        if not self.supports_disjoint_spans:
+            return None
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        for index, key in enumerate(keys):
+            block = self.get(key)
+            cached = block is not None and block.ref_cnt >= 0
+            if cached and start is None:
+                start = index
+            elif not cached and start is not None:
+                spans.append((start, index))
+                start = None
+        if start is not None:
+            spans.append((start, len(keys)))
+        return spans
+
+    def on_new_request(self, req_context: ReqContext) -> None:
+        return
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        return
+
+    def note_stored(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Called after a CPU store is allocated. Default does nothing."""
+        return
 
     def mark_evictable(self, key: OffloadKey) -> None:
         """Called when a block's ref_cnt transitions to 0."""

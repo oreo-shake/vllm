@@ -130,9 +130,25 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    def attach_session_tracker(self, tracker: object) -> None:
+        """Hand the GPU idle-gap tracker to a non-LRU CPU policy."""
+        assert self.connector_scheduler is not None
+        manager = getattr(self.connector_scheduler, "manager", None)
+        attach = getattr(manager, "attach_session_tracker", None)
+        if attach is not None:
+            attach(tracker)
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def take_offload_spans(self, request: "Request") -> list[tuple[int, int]]:
+        """CPU runs behind a hole. Empty unless the CPU policy asked for spans."""
+        assert self.connector_scheduler is not None
+        take = getattr(self.connector_scheduler, "take_offload_spans", None)
+        if take is None:
+            return []
+        return take(request)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

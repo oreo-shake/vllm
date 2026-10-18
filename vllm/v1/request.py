@@ -81,7 +81,9 @@ class Request:
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
-        self.priority = priority
+        # Omitted priority is 0, so a priority-0 first-request pin applies
+        # without the client sending the field.
+        self.priority = 0 if priority is None else priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request

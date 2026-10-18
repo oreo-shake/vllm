@@ -388,6 +388,12 @@ def flash_attn_varlen_func(
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
+        # _flash_attn_fwd reads leading dims from the tensor attribute.
+        # It does not accept aux_tensor_leading_dims as a keyword.
+        if aux_tensors is not None and aux_tensor_leading_dims is not None:
+            for tensor, leading_dim in zip(aux_tensors, aux_tensor_leading_dims):
+                tensor.__leading_dim__ = leading_dim
+
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -410,6 +416,9 @@ def flash_attn_varlen_func(
             learnable_sink=s_aux,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             output_scale=output_scale,
         )
     else:

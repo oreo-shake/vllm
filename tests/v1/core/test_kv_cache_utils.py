@@ -517,6 +517,18 @@ def test_tiered_free_kv_cache_block_queue_evict_first_tier():
         queue.popleft()
 
 
+def test_tiered_queue_defers_priority_zero_first_request():
+    """A pinned first request is taken only after unprotected free blocks."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=1)
+    blocks[1].session_protected = True
+    blocks[2].session_protected = False
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n([blocks[2], blocks[3]])
+    assert [b.block_id for b in queue.popleft_n(3)] == [0, 2, 3]
+    assert queue.popleft() is blocks[1]
+
+
 def test_tiered_free_kv_cache_block_queue_multiple_tiers():
     """Tiers are popped in order, each after the never-used blocks and before
     the LRU tail, and popping across empty tiers keeps them usable."""

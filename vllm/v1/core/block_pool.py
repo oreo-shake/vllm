@@ -800,6 +800,7 @@ class BlockPool:
         session_ttl_k: float = 1.0,
         idle_demote: str = "all",
         idle_protect_len: int = 0,
+        pin_first_request: bool = False,
     ) -> None:
         """Switch the free queue to one with `num_tiers` evict-first tiers used
         by `free_blocks_tiered`. Must be called before any allocation."""
@@ -837,6 +838,10 @@ class BlockPool:
             gap_window=session_gap_window,
             session_ttl_limit_s=session_ttl_limit_s,
             session_ttl_k=session_ttl_k,
+            pin_first_request=pin_first_request,
+            # Any non-LRU GPU policy keeps the idle-gap EWMA, including
+            # prefix pruning with the dead detector left off.
+            observe_idle=True,
         )
         # Overridable clock for tests / CPU simulator (defaults to wall time).
         if not hasattr(self, "_time_fn"):
@@ -909,8 +914,9 @@ class BlockPool:
         time_fn = getattr(self, "_time_fn", time.monotonic)
         now = time_fn()
         protect_from = max(0, len(blocks) - getattr(self, "_suffix_idle_protect_len", 0))
-        # Advisory only: matching blocks stay in the tiered free queue with
-        # ref_cnt == 0, so GPU pressure can still evict them before TTL.
+        # Priority 0 (also the default when the body omits priority) keeps
+        # the first request behind every other free block. Pressure still
+        # reclaims it once nothing else is free.
         protected_hashes = set(
             self.session_tracker.first_request_hashes_for(session_id, now)
         )

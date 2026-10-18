@@ -49,6 +49,12 @@ def get_offload_group_idx(key: OffloadKey) -> int:
 class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
+    session_id: str | None = None
+    # Omitted priority is 0. Only the CPU first-request pin reads this.
+    priority: int = 0
+    block_hashes: tuple[Any, ...] = ()
+    # Token index of each offload key, filled by the connector before touch.
+    token_positions: dict[OffloadKey, int] | None = None
 
 
 class LookupResult(Enum):
