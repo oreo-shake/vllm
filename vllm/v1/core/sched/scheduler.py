@@ -843,6 +843,15 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # GPU=local hits; CPU=ext_tokens (offload; not storage-aware).
+                    logger.info(
+                        "Request %s KV tier hits: GPU=%d CPU=%d. "
+                        "Inconsistent if you have storage tier",
+                        request.request_id,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+
                     # Skip request with pending mm encoding prefetches
                     if (
                         self.ec_connector is not None
