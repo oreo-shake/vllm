@@ -121,3 +121,67 @@ Request ... KV tier hits: GPU=0 CPU=192512 (contiguous=0 deferred=192512)
 Contiguous may still be `0` when prefixes were peeled; that is expected for
 this eviction policy. `CPU` should reflect the deferred runs that will load
 after the hole is recomputed.
+
+---
+
+## Issue 3 — `RequestOffloadState.finished_signaled` AttributeError at request finish
+
+### Symptom
+
+During `cpu-offload-eviction-sweep` / `lru-lru` (concurrency 48), the
+15‑minute stage completed with 0 client failures, then EngineCore died
+immediately afterward:
+
+```text
+AttributeError: 'RequestOffloadState' object has no attribute 'finished_signaled'
+  File ".../offloading/scheduler.py", line 1270, in build_connector_meta
+    req_status.finished_signaled = True
+```
+
+API then reported `EngineDeadError` and shut down (force-killed leftover
+engine process). Not caused by manually killing the server — it fired on
+the finish/teardown path right after `duration=900s` was reached.
+
+### Root cause
+
+Upstream `#49671` (*Defer request finalization until final store*) defers
+`manager.on_request_finished` until after the final `prepare_store` for
+finished requests, using a `finished_signaled` flag on
+`RequestOffloadState`.
+
+Our CPU-tier-eviction branch partially copied that pattern into
+`build_connector_meta` (assigning `finished_signaled = True`) but:
+
+1. Never declared `finished_signaled` on the `@dataclass(slots=True)`
+   `RequestOffloadState` — slots reject undeclared attributes.
+2. Still called `on_request_finished` early from `request_finished`, which
+   would double-finalize once the assignment worked.
+3. Still cleaned up finished requests via `_maybe_cleanup_finished_req` /
+   `req.is_finished()` instead of gating on `finished_signaled`.
+
+### Fix
+
+Port the full `#49671` contract in
+`vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`
+(keep local `_note_finished_recency` / eviction hooks):
+
+1. Add `finished_signaled: bool = False` on `RequestOffloadState`.
+2. Remove the early `on_request_finished` call from `request_finished`
+   for tracked requests (untracked requests still finalize immediately).
+3. Keep signaling + optional delete in `build_connector_meta` after store
+   prep for `finished_req_ids`.
+4. In `update_connector_output`, delete req state only when
+   `finished_signaled and not transfer_jobs`.
+5. In `reset_cache`, call `on_request_finished` only if not already
+   signaled.
+6. Drop `_maybe_cleanup_finished_req` (cleanup is owned by the finish
+   signal path).
+
+Canonical upstream: commit `d30b1ecd1b` / PR `#49671`.
+
+### Verification
+
+- Re-run `concurrency=48/lru-lru` (or any long session-replay stage): stage
+  end should no longer crash EngineCore on finished-request metadata build.
+- Confirm no `AttributeError: ... finished_signaled` / cascading
+  `EngineDeadError` in `vllm.log` after duration is reached.

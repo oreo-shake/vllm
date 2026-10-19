@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
@@ -10,6 +11,7 @@ from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -32,6 +34,11 @@ from vllm.v1.kv_offload.cpu.policies.prefix import (
     PrefixPruningCachePolicy,
     PrefixPruningOnSessionsCachePolicy,
 )
+
+logger = init_logger(__name__)
+
+# How often to emit the cumulative CPU eviction count.
+_EVICTION_LOG_INTERVAL_S = 10.0
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -82,6 +89,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
+        # Lifetime count of blocks removed to make room for new stores.
+        self._total_blocks_evicted: int = 0
+        # Start the interval after init so the first line is not an immediate 0.
+        self._last_eviction_log_time: float = time.monotonic()
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -248,6 +259,7 @@ class CPUOffloadingManager(OffloadingManager):
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
             assert self._num_evictable_cache_blocks >= 0
+            self._total_blocks_evicted += len(evicted)
 
             for key, block in evicted:
                 self._free_block(block)
@@ -370,4 +382,17 @@ class CPUOffloadingManager(OffloadingManager):
             )
             self.stores_skipped_in_current_batch = 0
 
+        self._maybe_log_eviction_total()
+
         return stats
+
+    def _maybe_log_eviction_total(self) -> None:
+        """Emit the lifetime CPU eviction count at most every 10 seconds."""
+        now = time.monotonic()
+        if now - self._last_eviction_log_time < _EVICTION_LOG_INTERVAL_S:
+            return
+        self._last_eviction_log_time = now
+        logger.info(
+            "CPU tier blocks evicted until now: %d",
+            self._total_blocks_evicted,
+        )

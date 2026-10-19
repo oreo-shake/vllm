@@ -50,7 +50,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -261,6 +261,8 @@ class RequestOffloadState:
     # Later CPU runs that are not contiguous with the GPU cursor.
     # Empty for lru and arc.
     offload_spans: list[tuple[int, int]] = field(default_factory=list)
+    # True once on_request_finished has been signaled to the manager.
+    finished_signaled: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -478,13 +480,6 @@ class OffloadingConnectorScheduler:
         for group_state in req_status.group_states:
             if group_state.offload_keys:
                 note_finished(group_state.offload_keys, req_status.req_context)
-
-    def _maybe_cleanup_finished_req(
-        self, req_id: str, req_status: RequestOffloadState
-    ) -> None:
-        """Clean up req_status if finished and no in-flight jobs."""
-        if req_status.req.is_finished() and not req_status.transfer_jobs:
-            del self._req_status[req_id]
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -1038,7 +1033,9 @@ class OffloadingConnectorScheduler:
                 continue
             req = req_status.req
 
-            if req.is_finished():
+            if req.status is RequestStatus.FINISHED_ABORTED:
+                num_tokens_after_batch = req.num_computed_tokens
+            elif req.is_finished():
                 num_tokens_after_batch = req.num_tokens
             else:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -1097,7 +1094,6 @@ class OffloadingConnectorScheduler:
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -1108,12 +1104,10 @@ class OffloadingConnectorScheduler:
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
                 logger.warning("Request %s: cannot store chunks", req_id)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             if self._refreshes_recency_from_connector():
@@ -1359,7 +1353,7 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if not req_status.transfer_jobs and req_status.req.is_finished():
+            if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1401,7 +1395,9 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_context)
             return False, None
 
-        self.manager.on_request_finished(req_status.req_context)
+        # Do not call on_request_finished here: final store prep still needs
+        # the request alive. Signal + cleanup happen in build_connector_meta
+        # after prepare_store for finished_req_ids (#49671).
         self._maybe_observe_lookup_async_delay(req_status)
 
         # Update offload keys with final block hash so _build_store_jobs can
@@ -1446,6 +1442,8 @@ class OffloadingConnectorScheduler:
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
+                if not status.finished_signaled:
+                    self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
