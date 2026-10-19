@@ -536,8 +536,15 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # pause=True: under async scheduling, num_computed_tokens advances
+            # when the last hole chunk is scheduled while tokens are still
+            # in flight. Without pausing, clip would drop the CPU span and
+            # recompute it. Pause until in-flight drains, then requeue loads.
             num_new_tokens = self._clip_to_offload_span(
-                request, num_new_tokens, request.num_computed_tokens
+                request,
+                num_new_tokens,
+                request.num_computed_tokens,
+                pause=True,
             )
             if (suffix_hit := self._suffix_hits.get(request.request_id)) is not None:
                 num_new_tokens = min(
@@ -751,6 +758,8 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 suffix_hit = None
                 num_suffix_hit_tokens = 0
+                deferred_span_tokens = 0
+                cpu_hit_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -832,10 +841,23 @@ class Scheduler(SchedulerInterface):
                                     request.request_id, []
                                 ).extend(spans)
 
+                        # Contiguous external tokens load immediately.
+                        # Deferred span tokens are also CPU hits; they load
+                        # after the hole in front is recomputed. Count both
+                        # here so the log / external hit rate stay consistent
+                        # with prefix_pruning* policies (do not re-count on
+                        # the later span-load path).
+                        deferred_span_tokens = self._pending_offload_span_tokens(
+                            request.request_id
+                        )
+                        cpu_hit_tokens = (
+                            num_external_computed_tokens + deferred_span_tokens
+                        )
+
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
-                        connector_prefix_cache_hits = num_external_computed_tokens
+                        connector_prefix_cache_hits = cpu_hit_tokens
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -843,13 +865,15 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
-                    # GPU=local hits; CPU=ext_tokens (offload; not storage-aware).
+                    # GPU=local hits; CPU=contiguous external + deferred spans.
                     logger.info(
-                        "Request %s KV tier hits: GPU=%d CPU=%d. "
-                        "Inconsistent if you have storage tier",
+                        "Request %s KV tier hits: GPU=%d CPU=%d "
+                        "(contiguous=%d deferred=%d)",
                         request.request_id,
                         num_new_local_computed_tokens,
+                        cpu_hit_tokens,
                         num_external_computed_tokens,
+                        deferred_span_tokens,
                     )
 
                     # Skip request with pending mm encoding prefetches
@@ -874,7 +898,7 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens
                             + num_suffix_hit_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_external_cached_tokens=cpu_hit_tokens,
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
@@ -896,10 +920,10 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens = ext_tokens
                         load_kv_async = span_async
                         num_computed_tokens = num_computed_tokens + ext_tokens
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - request.num_computed_tokens
-                        )
-                        connector_prefix_cache_hits = ext_tokens
+                        # Deferred span hits were already counted on the
+                        # first lookup; do not inflate queries/hits again.
+                        connector_prefix_cache_queries = 0
+                        connector_prefix_cache_hits = 0
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -2523,6 +2547,13 @@ class Scheduler(SchedulerInterface):
         policy = transfer.get_from_extra_config("eviction_policy", "lru")
         return policy not in ("lru", "arc")
 
+    def _pending_offload_span_tokens(self, request_id: str) -> int:
+        """Tokens covered by deferred CPU runs waiting behind a hole."""
+        spans = self._offload_spans.get(request_id)
+        if not spans:
+            return 0
+        return sum(end - start for start, end in spans)
+
     def _requeue_for_offload_span(self, request: Request, req_index: int) -> bool:
         """Send a request back to waiting so a CPU run can load contiguously.
 
@@ -2603,10 +2634,10 @@ class Scheduler(SchedulerInterface):
                 request, num_new_tokens, num_computed, pause
             )
         if num_computed >= start:
-            # Inside a cached CPU run. The running loop must not compute
-            # into it while earlier tokens are still in flight; it pauses
-            # until the requeue can load the run. The waiting path never
-            # pauses: a run left here is recomputed.
+            # Inside a cached CPU run. The running loop must pause
+            # (pause=True) until in-flight hole tokens drain and
+            # _requeue_for_offload_span can load the run. The waiting
+            # path keeps pause=False: a run left here is recomputed.
             if pause:
                 return 0
             spans.pop(0)
