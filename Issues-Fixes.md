@@ -185,3 +185,91 @@ Canonical upstream: commit `d30b1ecd1b` / PR `#49671`.
   end should no longer crash EngineCore on finished-request metadata build.
 - Confirm no `AttributeError: ... finished_signaled` / cascading
   `EngineDeadError` in `vllm.log` after duration is reached.
+
+---
+
+## Issue 4 — Deferred CPU spans double-counted on waiting retries
+
+### Symptom
+
+Under `lru-sessions` / `prefix_pruning_on_sessions` with high GPU occupancy,
+EngineCore died mid-stage:
+
+```text
+AssertionError: assert num_cached_tokens <= num_prompt_tokens
+  File ".../metrics/stats.py", in PrefillStats.set
+  File ".../scheduler.py", in schedule  # prefill_stats.set(...)
+```
+
+Just before the crash, the same request logged:
+
+```text
+GPU=48 CPU=72960  (contiguous=0 deferred=72960)
+GPU=48 CPU=145920 (contiguous=0 deferred=145920)   # exact 2×
+```
+
+The hit log also fired dozens of times for a single `chatcmpl-*` while the
+request was still waiting (GPU ~93% full). Benchmark ended early
+(`duration_reached=False`) with cascading connection errors after the
+server died.
+
+### Root cause
+
+Two interacting problems:
+
+1. **Span ownership used extend, not replace.**  
+   The initial waiting path (`num_computed_tokens == 0`) called
+   `take_offload_spans()` and **extended** into `scheduler._offload_spans`.
+   When `allocate_slots` failed, the request stayed waiting with
+   `num_computed_tokens == 0`. The next schedule step ran a fresh
+   `_lookup`, which **appended** the same later runs on the connector, then
+   `take_offload_spans` extended them again → deferred tokens doubled.
+   `prefill_stats.set(local + contiguous + deferred)` then exceeded the
+   prompt length and asserted (assertions kept; the bug was the count).
+
+2. **Hit log / prefill_stats ran on every probe, not on admission.**  
+   The `KV tier hits` INFO and `prefill_stats.set` sat before
+   `allocate_slots`. GPU-full retries re-entered the initial-lookup path
+   every engine step, so one request polluted the log without making
+   progress. That is also when the doubled deferred count was published
+   into `prefill_stats`.
+
+`_match_offload_span` had the same extend hazard: a mid-request connector
+lookup rediscovers later runs that already live in `_offload_spans`.
+
+### Fix
+
+Architectural span ownership + publish-on-admit (no assertion removal,
+no “log once” flag):
+
+1. **Connector** (`offloading/scheduler.py`):
+   - Clear `req_status.offload_spans` at the start of each `_lookup`.
+   - **Assign** deferred runs from `_span_lookup` (replace, never append).
+   - Document that `take_offload_spans` returns the full plan for that
+     discovery.
+
+2. **Scheduler initial lookup** (`v1/core/sched/scheduler.py`):
+   - After `take_offload_spans`, **replace**
+     `_offload_spans[req_id]` (or pop if empty). Never extend.
+
+3. **Scheduler span load** (`_match_offload_span`):
+   - Still call `get_num_new_matched_tokens` for the contiguous load from
+     the cursor, but **discard** any rediscovered deferred runs from
+     `take_offload_spans`. The deferred plan was fixed at initial lookup;
+     only trim/pop as loads complete.
+
+4. **Logging / prefill stats**:
+   - Move `KV tier hits` logging and `prefill_stats.set` to **after**
+     successful `allocate_slots` (request actually admitted: running or
+     `WAITING_FOR_REMOTE_KVS`).
+   - Still computed on the initial-lookup path only (`initial_kv_lookup`);
+     span-load admissions do not re-publish (deferred already counted).
+
+### Verification
+
+- Re-run `concurrency=48/lru-sessions` (or any prefix_pruning* stage under
+  GPU pressure): no `num_cached_tokens <= num_prompt_tokens` crash.
+- Each request should log `KV tier hits` once per successful initial
+  admission, not once per failed waiting probe.
+- Deferred values must not jump by exact multiples across retries for the
+  same request.

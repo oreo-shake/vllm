@@ -107,3 +107,24 @@ def test_pending_offload_span_tokens_sums_deferred_runs():
         8192 - 4096
     )
     assert sched._pending_offload_span_tokens("missing") == 0
+
+
+def test_match_offload_span_discards_rediscovered_deferred_runs():
+    """Mid-request lookup must not re-ingest later runs into _offload_spans."""
+    req_id = "r0"
+    sched, _ = _scheduler_with_spans(req_id, [(1024, 2048), (4096, 8192)])
+    request = _request(req_id, num_computed_tokens=1024)
+
+    rediscovered = [(4096, 8192)]  # same later run already in the plan
+    connector = MagicMock()
+    connector.get_num_new_matched_tokens.return_value = (1024, False)
+    connector.take_offload_spans.return_value = list(rediscovered)
+    sched.connector = connector
+
+    ext_tokens, load_async = sched._match_offload_span(request, 1024)
+
+    assert (ext_tokens, load_async) == (1024, False)
+    connector.take_offload_spans.assert_called_once_with(request)
+    # Current run consumed; remaining plan unchanged (not duplicated).
+    assert sched._offload_spans[req_id] == [(4096, 8192)]
+    assert sched._pending_offload_span_tokens(req_id) == 8192 - 4096

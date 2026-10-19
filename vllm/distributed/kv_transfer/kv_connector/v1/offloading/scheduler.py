@@ -572,7 +572,13 @@ class OffloadingConnectorScheduler:
         return 0, runs
 
     def take_offload_spans(self, request: Request) -> list[tuple[int, int]]:
-        """Pop CPU runs that sit behind a hole. Empty for lru and arc."""
+        """Pop deferred CPU runs from the latest lookup. Empty for lru/arc.
+
+        Each successful ``_lookup`` replaces ``offload_spans`` with the
+        deferred runs discovered on that call. The scheduler must treat the
+        returned list as the full deferred plan for that discovery (assign /
+        replace), not extend it onto a previous take.
+        """
         req_status = self._req_status.get(request.request_id)
         if req_status is None or not req_status.offload_spans:
             return []
@@ -635,6 +641,9 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+        # Fresh discovery for this lookup cursor; avoids carrying deferred runs
+        # from a prior call when this one early-returns with no spans.
+        req_status.offload_spans = []
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
         # in the current convergence iteration. Reset when a non-eagle group
@@ -712,13 +721,17 @@ class OffloadingConnectorScheduler:
                     )
                 if num_hit_chunks == 0 and not later_spans:
                     return 0
-                for start, end in later_spans:
-                    req_status.offload_spans.append(
-                        (
-                            (start_chunk_idx + start) * tokens_per_chunk,
-                            (start_chunk_idx + end) * tokens_per_chunk,
-                        )
+                # Replace (do not append): _lookup may re-enter the group loop,
+                # and the scheduler may retry get_num_new_matched_tokens while
+                # the request is still waiting. Appending would duplicate the
+                # same deferred runs and inflate CPU hit counts.
+                req_status.offload_spans = [
+                    (
+                        (start_chunk_idx + start) * tokens_per_chunk,
+                        (start_chunk_idx + end) * tokens_per_chunk,
                     )
+                    for start, end in later_spans
+                ]
 
                 if num_hit_chunks is None:
                     defer_lookup = True

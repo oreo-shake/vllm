@@ -760,9 +760,12 @@ class Scheduler(SchedulerInterface):
                 num_suffix_hit_tokens = 0
                 deferred_span_tokens = 0
                 cpu_hit_tokens = 0
+                # True for the initial GPU/CPU tier lookup. Span-load retries
+                # use num_computed_tokens > 0 and must not re-publish hits.
+                initial_kv_lookup = request.num_computed_tokens == 0
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if initial_kv_lookup:
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
@@ -833,20 +836,24 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        # This discovery owns the deferred plan. Replace any
+                        # spans left from a prior failed admission of the same
+                        # waiting request; never extend (that doubles deferred
+                        # tokens and trips prefill_stats asserts).
                         take_spans = getattr(self.connector, "take_offload_spans", None)
                         if take_spans is not None:
                             spans = take_spans(request)
                             if spans:
-                                self._offload_spans.setdefault(
-                                    request.request_id, []
-                                ).extend(spans)
+                                self._offload_spans[request.request_id] = list(spans)
+                            else:
+                                self._offload_spans.pop(request.request_id, None)
 
                         # Contiguous external tokens load immediately.
                         # Deferred span tokens are also CPU hits; they load
                         # after the hole in front is recomputed. Count both
-                        # here so the log / external hit rate stay consistent
-                        # with prefix_pruning* policies (do not re-count on
-                        # the later span-load path).
+                        # here so external hit rate stays consistent with
+                        # prefix_pruning* policies (do not re-count on the
+                        # later span-load path).
                         deferred_span_tokens = self._pending_offload_span_tokens(
                             request.request_id
                         )
@@ -859,22 +866,13 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = cpu_hit_tokens
 
-                    # Total computed tokens (local + external).
+                    # Total computed tokens (local + contiguous external).
+                    # Deferred spans are not computed yet; they load after the
+                    # hole is recomputed.
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
-
-                    # GPU=local hits; CPU=contiguous external + deferred spans.
-                    logger.info(
-                        "Request %s KV tier hits: GPU=%d CPU=%d "
-                        "(contiguous=%d deferred=%d)",
-                        request.request_id,
-                        num_new_local_computed_tokens,
-                        cpu_hit_tokens,
-                        num_external_computed_tokens,
-                        deferred_span_tokens,
-                    )
 
                     # Skip request with pending mm encoding prefetches
                     if (
@@ -887,19 +885,6 @@ class Scheduler(SchedulerInterface):
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
-
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if (
-                        request.prefill_stats is not None
-                        and request.num_preemptions <= 0
-                    ):
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens
-                            + num_suffix_hit_tokens,
-                            num_external_cached_tokens=cpu_hit_tokens,
-                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -1064,6 +1049,34 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # Publish the initial tier-hit plan only when this request is
+                # actually admitted (slots allocated). Probing while GPU-full
+                # retries the waiting path with num_computed_tokens == 0; logging
+                # or recording stats there both pollutes and, before span
+                # replace semantics, could double-count deferred CPU runs.
+                if initial_kv_lookup:
+                    logger.info(
+                        "Request %s KV tier hits: GPU=%d CPU=%d "
+                        "(contiguous=%d deferred=%d)",
+                        request.request_id,
+                        num_new_local_computed_tokens,
+                        cpu_hit_tokens,
+                        num_external_computed_tokens,
+                        deferred_span_tokens,
+                    )
+                    # Track first scheduled prefill, not post-preemption repeats.
+                    if (
+                        request.prefill_stats is not None
+                        and request.num_preemptions <= 0
+                    ):
+                        assert num_computed_tokens <= request.num_prompt_tokens
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=num_new_local_computed_tokens
+                            + num_suffix_hit_tokens,
+                            num_external_cached_tokens=cpu_hit_tokens,
+                        )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2585,6 +2598,11 @@ class Scheduler(SchedulerInterface):
         returns the connector's ``(external_tokens, load_async)``. A run
         the connector will not load is dropped so the scheduler recomputes
         it instead of scheduling zero tokens.
+
+        The deferred plan in ``_offload_spans`` was fixed at the initial
+        tier lookup. A mid-request connector lookup may rediscover later
+        runs; those must be discarded, not merged, or the same intervals
+        are ingested twice.
         """
         spans = self._offload_spans.get(request.request_id)
         if self.connector is None or not spans or num_computed < spans[0][0]:
@@ -2592,12 +2610,11 @@ class Scheduler(SchedulerInterface):
         ext_tokens, load_async = self.connector.get_num_new_matched_tokens(
             request, num_computed
         )
+        # Drop rediscovered deferred runs from this lookup; do not extend
+        # the scheduler plan (that plan is already authoritative).
         take_spans = getattr(self.connector, "take_offload_spans", None)
         if take_spans is not None:
-            extra = take_spans(request)
-            if extra:
-                self._offload_spans.setdefault(request.request_id, []).extend(extra)
-                spans = self._offload_spans[request.request_id]
+            take_spans(request)
         if ext_tokens is None:
             return None, False
         if ext_tokens > 0:
