@@ -261,6 +261,10 @@ class RequestOffloadState:
     # Later CPU runs that are not contiguous with the GPU cursor.
     # Empty for lru and arc.
     offload_spans: list[tuple[int, int]] = field(default_factory=list)
+    # Keys held via manager.pin_deferred for the current deferred plan so
+    # hole-store eviction cannot punch a span the scheduler still intends
+    # to load. Cleared / refreshed by sync_deferred_span_pins.
+    deferred_pin_keys: list[OffloadKey] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -585,6 +589,56 @@ class OffloadingConnectorScheduler:
         spans = req_status.offload_spans
         req_status.offload_spans = []
         return spans
+
+    def _keys_for_spans(
+        self, req_status: RequestOffloadState, spans: Sequence[tuple[int, int]]
+    ) -> list[OffloadKey]:
+        """Map token-space deferred spans to offload keys (all groups)."""
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            offload_keys = group_state.offload_keys
+            for start, end in spans:
+                start_chunk = start // tokens_per_chunk
+                end_chunk = cdiv(end, tokens_per_chunk)
+                keys.extend(offload_keys[start_chunk:end_chunk])
+        return keys
+
+    def sync_deferred_span_pins(
+        self, request: Request, spans: Sequence[tuple[int, int]]
+    ) -> None:
+        """Pin CPU keys for the scheduler's deferred plan; unpin the previous set.
+
+        Called only after the scheduler has admitted the request
+        (``allocate_slots`` succeeded). Pinning on waiting probes would hold
+        CPU capacity while GPU-full retries cannot run the hole recompute,
+        which can deadlock stores. Once pinned, hole-store eviction cannot
+        punch the planned span head / chase a moving deferred tail.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return
+        pin = getattr(self.manager, "pin_deferred", None)
+        unpin = getattr(self.manager, "unpin_deferred", None)
+        if pin is None or unpin is None:
+            return
+        if req_status.deferred_pin_keys:
+            unpin(req_status.deferred_pin_keys)
+            req_status.deferred_pin_keys = []
+        if not spans:
+            return
+        req_status.update_offload_keys()
+        keys = self._keys_for_spans(req_status, spans)
+        req_status.deferred_pin_keys = list(pin(keys))
+
+    def _clear_deferred_span_pins(self, req_status: RequestOffloadState) -> None:
+        unpin = getattr(self.manager, "unpin_deferred", None)
+        if unpin is None or not req_status.deferred_pin_keys:
+            return
+        unpin(req_status.deferred_pin_keys)
+        req_status.deferred_pin_keys = []
 
     def _refreshes_recency_from_connector(self) -> bool:
         return bool(getattr(self.manager, "refreshes_recency_from_connector", True))
@@ -1275,6 +1329,7 @@ class OffloadingConnectorScheduler:
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
+                self._clear_deferred_span_pins(req_status)
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
@@ -1367,6 +1422,7 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
+                self._clear_deferred_span_pins(req_status)
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1457,7 +1513,11 @@ class OffloadingConnectorScheduler:
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
+                self._clear_deferred_span_pins(status)
                 del self._req_status[req_id]
+            else:
+                # Cache wipe drops the blocks; drop pin bookkeeping too.
+                status.deferred_pin_keys = []
 
         # Reset offloading manager cache
         self.manager.reset_cache()

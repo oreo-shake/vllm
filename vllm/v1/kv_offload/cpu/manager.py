@@ -173,6 +173,39 @@ class CPUOffloadingManager(OffloadingManager):
         if hook is not None:
             hook(tracker)
 
+    def pin_deferred(
+        self, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        """Hold ready blocks so hole-store eviction cannot drop deferred spans.
+
+        Same ref_cnt / mark_non_evictable accounting as ``prepare_load``, but
+        without building a load spec. Returns the keys that were actually
+        pinned (missing or not-ready keys are skipped).
+        """
+        pinned: list[OffloadKey] = []
+        for key in keys:
+            block = self._policy.get(key)
+            if block is None or not block.is_ready:
+                continue
+            if block.ref_cnt == 0:
+                self._policy.mark_non_evictable(key)
+                self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
+                assert self._num_evictable_cache_blocks >= 0
+            block.ref_cnt += 1
+            pinned.append(key)
+        return pinned
+
+    def unpin_deferred(self, keys: Collection[OffloadKey]) -> None:
+        """Release pins from ``pin_deferred``. Tolerates already-evicted keys."""
+        for key in keys:
+            block = self._policy.get(key)
+            if block is None or block.ref_cnt <= 0:
+                continue
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
+                self._policy.mark_evictable(key)
+
     @override
     def prepare_load(
         self,

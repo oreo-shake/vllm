@@ -293,6 +293,10 @@ class Scheduler(SchedulerInterface):
         self._suffix_hits: dict[str, tuple[int, int]] = {}
         # CPU runs that start after a hole. Absent for lru and arc.
         self._offload_spans: dict[str, list[tuple[int, int]]] = {}
+        # Requests whose deferred plan has been pinned on CPU. Pin only after
+        # allocate_slots succeeds — never on waiting probes — so GPU-full
+        # retries cannot hold CPU capacity and deadlock stores.
+        self._offload_span_pinned: set[str] = set()
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
         elif self._cpu_policy_needs_idle_average():
@@ -843,10 +847,9 @@ class Scheduler(SchedulerInterface):
                         take_spans = getattr(self.connector, "take_offload_spans", None)
                         if take_spans is not None:
                             spans = take_spans(request)
-                            if spans:
-                                self._offload_spans[request.request_id] = list(spans)
-                            else:
-                                self._offload_spans.pop(request.request_id, None)
+                            # Record only: pinning waits until allocate_slots
+                            # succeeds (see _pin_offload_spans_after_admit).
+                            self._record_offload_spans(request, spans or None)
 
                         # Contiguous external tokens load immediately.
                         # Deferred span tokens are also CPU hits; they load
@@ -1049,6 +1052,12 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # Freeze the deferred CPU plan now that hole recompute (or a
+                # contiguous load that will later hit a hole) can actually run.
+                # Pinning earlier — on failed waiting probes — can deadlock:
+                # many waiters hold CPU capacity while GPU stays full.
+                self._pin_offload_spans_after_admit(request)
 
                 # Publish the initial tier-hit plan only when this request is
                 # actually admitted (slots allocated). Probing while GPU-full
@@ -2567,6 +2576,51 @@ class Scheduler(SchedulerInterface):
             return 0
         return sum(end - start for start, end in spans)
 
+    def _sync_offload_span_pins(self, request: Request) -> None:
+        """Align CPU pins with the current deferred plan (no-op if never pinned)."""
+        rid = request.request_id
+        if rid not in self._offload_span_pinned:
+            return
+        if self.connector is None:
+            self._offload_span_pinned.discard(rid)
+            return
+        sync = getattr(self.connector, "sync_deferred_span_pins", None)
+        if sync is None:
+            self._offload_span_pinned.discard(rid)
+            return
+        spans = self._offload_spans.get(rid, [])
+        sync(request, spans)
+        if not spans:
+            self._offload_span_pinned.discard(rid)
+
+    def _record_offload_spans(
+        self, request: Request, spans: list[tuple[int, int]] | None
+    ) -> None:
+        """Replace (or clear) the deferred plan.
+
+        Does **not** newly pin. Waiting probes must be able to refresh the
+        plan while GPU-full without holding CPU capacity. If this request was
+        already admitted and pinned, keep pins aligned with the plan.
+        """
+        if spans:
+            self._offload_spans[request.request_id] = list(spans)
+        else:
+            self._offload_spans.pop(request.request_id, None)
+        self._sync_offload_span_pins(request)
+
+    def _pin_offload_spans_after_admit(self, request: Request) -> None:
+        """Pin deferred CPU keys once allocate_slots has succeeded.
+
+        Establishes ground truth for the hole/deferred split so hole-store
+        eviction cannot chase a moving span tail. Must not run on failed
+        waiting→running promotion attempts.
+        """
+        rid = request.request_id
+        if rid not in self._offload_spans:
+            return
+        self._offload_span_pinned.add(rid)
+        self._sync_offload_span_pins(request)
+
     def _requeue_for_offload_span(self, request: Request, req_index: int) -> bool:
         """Send a request back to waiting so a CPU run can load contiguously.
 
@@ -2581,6 +2635,7 @@ class Scheduler(SchedulerInterface):
             spans.pop(0)
             if not spans:
                 self._offload_spans.pop(request.request_id, None)
+            self._sync_offload_span_pins(request)
             return self._requeue_for_offload_span(request, req_index)
         if request.num_computed_tokens < start:
             return False
@@ -2595,14 +2650,17 @@ class Scheduler(SchedulerInterface):
         """Load a CPU run that the request has already reached.
 
         Returns None when no span is waiting at this cursor. Otherwise
-        returns the connector's ``(external_tokens, load_async)``. A run
-        the connector will not load is dropped so the scheduler recomputes
-        it instead of scheduling zero tokens.
+        returns the connector's ``(external_tokens, load_async)``.
 
-        The deferred plan in ``_offload_spans`` was fixed at the initial
-        tier lookup. A mid-request connector lookup may rediscover later
-        runs; those must be discarded, not merged, or the same intervals
-        are ingested twice.
+        On a successful contiguous load from the cursor, rediscovered later
+        runs from this lookup are discarded (the deferred plan was fixed at
+        initial lookup; only trim/pop as loads complete — never extend).
+
+        On a miss at the planned head (``ext_tokens == 0``), **replace** the
+        plan with rediscovered later runs (assign, never extend). Hole-store
+        eviction can punch the planned span head; rediscovery recovers the
+        still-resident suffix so a micro-hole can be recomputed and the
+        remainder loaded. Empty rediscovery clears the plan for recompute.
         """
         spans = self._offload_spans.get(request.request_id)
         if self.connector is None or not spans or num_computed < spans[0][0]:
@@ -2610,11 +2668,10 @@ class Scheduler(SchedulerInterface):
         ext_tokens, load_async = self.connector.get_num_new_matched_tokens(
             request, num_computed
         )
-        # Drop rediscovered deferred runs from this lookup; do not extend
-        # the scheduler plan (that plan is already authoritative).
         take_spans = getattr(self.connector, "take_offload_spans", None)
+        rediscovered: list[tuple[int, int]] = []
         if take_spans is not None:
-            take_spans(request)
+            rediscovered = list(take_spans(request))
         if ext_tokens is None:
             return None, False
         if ext_tokens > 0:
@@ -2625,10 +2682,13 @@ class Scheduler(SchedulerInterface):
                     spans[0] = (loaded_until, end)
                     break
                 spans.pop(0)
-        else:
-            spans.pop(0)
-        if not spans:
-            self._offload_spans.pop(request.request_id, None)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            self._sync_offload_span_pins(request)
+            return ext_tokens, load_async
+
+        # Miss at planned head: refresh from rediscovery (replace, not extend).
+        self._record_offload_spans(request, rediscovered or None)
         return ext_tokens, load_async
 
     def _clip_to_offload_span(
@@ -2647,6 +2707,7 @@ class Scheduler(SchedulerInterface):
             spans.pop(0)
             if not spans:
                 self._offload_spans.pop(request.request_id, None)
+            self._sync_offload_span_pins(request)
             return self._clip_to_offload_span(
                 request, num_new_tokens, num_computed, pause
             )
@@ -2660,6 +2721,7 @@ class Scheduler(SchedulerInterface):
             spans.pop(0)
             if not spans:
                 self._offload_spans.pop(request.request_id, None)
+            self._sync_offload_span_pins(request)
             return self._clip_to_offload_span(
                 request, num_new_tokens, num_computed, pause
             )
@@ -2670,7 +2732,7 @@ class Scheduler(SchedulerInterface):
         pool when an in-flight GPU step may still write them.
         """
         self._suffix_hits.pop(request.request_id, None)
-        self._offload_spans.pop(request.request_id, None)
+        self._record_offload_spans(request, None)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
