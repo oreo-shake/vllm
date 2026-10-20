@@ -26,6 +26,10 @@ class LRUCachePolicy(CachePolicy):
      - A request-scoped access.
     """
 
+    # Recency is updated at insert and on_request_finished. Per-step connector
+    # touch would reverse key order mid-flight and make the tail the victim.
+    refreshes_recency_from_connector = False
+
     def __init__(self, cache_capacity: int):
         super().__init__(cache_capacity)
         self.chunks: dict[OffloadKey, ChunkStatus] = {}

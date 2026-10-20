@@ -49,6 +49,10 @@ class ARCCachePolicy(CachePolicy):
         - B2 hit: Frequent access patterns matter more → decrease T1.
     """
 
+    # Match LRU: request-scoped access updates frequency; connector touch
+    # must not rewrite order on every lookup/store.
+    refreshes_recency_from_connector = False
+
     def __init__(self, cache_capacity: int):
         super().__init__(cache_capacity)
         self.target_t1_size: float = 0.0

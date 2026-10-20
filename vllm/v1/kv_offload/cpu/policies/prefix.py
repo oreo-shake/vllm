@@ -193,6 +193,19 @@ class PrefixPruningCachePolicy(CachePolicy):
         self._refresh_lru_order(present)
 
     @override
+    def note_stored(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        # Store path also records position/session even if connector touch
+        # has not run yet (or runs only on lookup).
+        session_id = _session_id(req_context)
+        for key in keys:
+            if key not in self.chunks:
+                continue
+            self._note_position(key, req_context)
+            self._note_session(key, session_id)
+
+    @override
     def on_request_finished(
         self,
         key_groups: Sequence[Sequence[OffloadKey]],

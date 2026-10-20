@@ -747,6 +747,40 @@ class OffloadingConnectorScheduler:
             num = min(num, req_status.req.num_prompt_tokens)
         return num
 
+    def _refreshes_recency_from_connector(self) -> bool:
+        return bool(getattr(self.manager, "refreshes_recency_from_connector", True))
+
+    def _touch(self, req_status: RequestOffloadState) -> None:
+        """Refresh CPU policy recency/positions for prefix-tier policies.
+
+        Fills ``token_positions`` from chunk index (start token) and calls
+        ``manager.touch``. Positions are also available via
+        ``get_offload_key_position`` (end token) from ``update_offload_keys``.
+        """
+        positions: dict[OffloadKey, int] = {}
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            for index, key in enumerate(group_state.offload_keys):
+                positions[key] = index * tokens_per_chunk
+        req_status.req_context.token_positions = positions
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:
+                self.manager.touch(group_state.offload_keys, req_status.req_context)
+            else:
+                chunks_to_skip = max(
+                    0,
+                    group_state.num_hit_chunks
+                    - group_config.sliding_window_size_in_chunks,
+                )
+                self.manager.touch(
+                    group_state.offload_keys[chunks_to_skip:],
+                    req_status.req_context,
+                )
+
     def _maximal_prefix_lookup(
         self,
         keys: Iterable[OffloadKey],
@@ -1251,6 +1285,9 @@ class OffloadingConnectorScheduler:
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+
+        if self._refreshes_recency_from_connector():
+            self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
 
@@ -1908,6 +1945,9 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
+
+            if self._refreshes_recency_from_connector():
+                self._touch(req_status)
 
             keys_to_store = set(store_output.keys_to_store)
 
