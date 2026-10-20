@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -19,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -27,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
     to_event_extra_keys,
 )
+from vllm.v1.core.session_liveness import SessionLivenessTracker
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -194,6 +197,14 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self.session_tracker = SessionLivenessTracker()
+        self._suffix_idle_ttl_s = 0.0
+        self._suffix_idle_demote = "all"
+        self._suffix_idle_protect_len = 0
+        self._time_fn = time.monotonic
+        # Content hashes of the detected system-prompt prefix. Matching
+        # cached blocks get an extra ref and never join the free queue.
+        self._pinned_hashes: set[BlockHash] = set()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -606,6 +617,8 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        if block.pinned and not self._block_has_pinned_hash(block):
+            self._release_pin_hold(block)
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -644,6 +657,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if get_block_hash(block_hash_with_group_id) in self._pinned_hashes:
+            self._apply_pin_hold(block)
 
     def move_block_hashes(
         self,
@@ -678,6 +693,19 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        ttl_s = getattr(self, "_suffix_idle_ttl_s", 0.0) or 0.0
+        queue = self.free_block_queue
+        time_fn = getattr(self, "_time_fn", time.monotonic)
+        if isinstance(queue, TieredFreeKVCacheBlockQueue):
+            now = time_fn()
+            self.promote_dead_session_blocks(now)
+            if ttl_s > 0:
+                queue.demote_idle(
+                    ttl_s,
+                    now=now,
+                    mode=getattr(self, "_suffix_idle_demote", "all"),
+                )
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
@@ -686,15 +714,32 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+                if block.pinned:
+                    raise RuntimeError(
+                        f"Pinned system-prompt block {block.block_id} was "
+                        "popped from the free queue"
+                    )
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
+                block.session_id = None
+                block.evict_tier = None
+                block.idle_protect = False
+                block.session_protected = False
+                block.pinned = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
+                block.session_id = None
+                block.evict_tier = None
+                block.idle_protect = False
+                block.session_protected = False
+                block.pinned = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -794,6 +839,9 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
+                if self._block_has_pinned_hash(block):
+                    self._apply_pin_hold(block)
+                    continue
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
@@ -807,6 +855,180 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
+
+    def enable_prefix_first_eviction(
+        self,
+        num_tiers: int = 1,
+        idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+        session_ttl_limit_s: float = 0.0,
+        session_ttl_k: float = 1.0,
+        idle_demote: str = "all",
+        idle_protect_len: int = 0,
+        pin_first_request: bool = False,
+    ) -> None:
+        """Switch the free queue to one with `num_tiers` evict-first tiers used
+        by `free_blocks_tiered`. Must be called before any allocation."""
+        assert not isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        assert len(free_blocks) == self.num_gpu_blocks - 1, (
+            "prefix-first eviction must be enabled before any block is allocated"
+        )
+        for block in free_blocks:
+            block.prev_free_block = block.next_free_block = None
+            block.freed_at = None
+            block.session_id = None
+            block.evict_tier = None
+            block.idle_protect = False
+            block.session_protected = False
+            block.pinned = False
+        self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
+        self._suffix_idle_ttl_s = idle_ttl_s
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "idle_demote must be 'all', 'protect', or 'step', "
+                f"got {idle_demote}"
+            )
+        if idle_protect_len < 0:
+            raise ValueError(
+                f"idle_protect_len must be >= 0, got {idle_protect_len}"
+            )
+        self._suffix_idle_demote = idle_demote
+        self._suffix_idle_protect_len = idle_protect_len
+        self.session_tracker = SessionLivenessTracker(
+            min_ttl_s=session_dead_ttl_s,
+            ewa_alpha=session_ewa_alpha,
+            dead_k=session_dead_k,
+            min_gaps=session_min_gaps,
+            detector=session_detector,  # type: ignore[arg-type]
+            quantile=session_quantile,
+            gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
+            pin_first_request=pin_first_request,
+            # Any non-LRU GPU policy keeps the idle-gap EWMA, including
+            # prefix pruning with the dead detector left off.
+            observe_idle=True,
+        )
+        # Overridable clock for tests / CPU simulator (defaults to wall time).
+        if not hasattr(self, "_time_fn"):
+            self._time_fn = time.monotonic
+
+    def promote_dead_session_blocks(self, now: float | None = None) -> int:
+        """Move a predicted-dead session's remaining unique KV to evict-first.
+
+        Unlike idle-TTL demotion (peel another prefix layer), this promotes
+        every hashed free block of that session so the whole leftover suffix
+        is reclaimed before live sessions are touched.
+        """
+        tracker = self.session_tracker
+        if not tracker.enabled:
+            return 0
+        queue = self.free_block_queue
+        if not isinstance(queue, TieredFreeKVCacheBlockQueue):
+            return 0
+        if now is None:
+            now = self._time_fn()
+        dead = tracker.dead_session_ids(now)
+        if not dead:
+            return 0
+        dead_set = set(dead)
+        to_promote = [
+            block
+            for block in queue.get_all_free_blocks()
+            if block.session_id in dead_set
+            and block.block_hash is not None
+            and not block.pinned
+            and not self._block_has_pinned_hash(block)
+        ]
+        if not to_promote:
+            tracker.mark_promoted(dead)
+            return 0
+        for block in to_promote:
+            queue.remove(block)
+            block.session_protected = False
+        queue.prepend_n_to_tier(to_promote, 0)
+        tracker.mark_promoted(dead)
+        return len(to_promote)
+
+    def free_blocks_tiered(
+        self,
+        blocks: Sequence[KVCacheBlock],
+        first_tier_len: int,
+        tier_len: int = 0,
+        session_id: str | None = None,
+    ) -> None:
+        """Free a request's blocks, given in token order, into the evict-first
+        tiers by block position.
+
+        Blocks at index < `first_tier_len` join tier 0. With `tier_len` > 0,
+        each following run of `tier_len` blocks joins the next tier and blocks
+        past the last tier join the LRU tail; with `tier_len` == 0 all of them
+        join the LRU tail. Within each tier, earlier blocks are evicted first,
+        so the evicted region of a request grows from its first block toward
+        its last one.
+
+        Args:
+            blocks: The request's blocks in token order.
+            first_tier_len: The number of leading blocks for tier 0.
+            tier_len: The number of blocks per tier after tier 0.
+            session_id: Session that last owned these blocks, if any.
+        """
+        queue = self.free_block_queue
+        assert isinstance(queue, TieredFreeKVCacheBlockQueue)
+        num_tiers = queue.num_tiers
+        tiers: list[list[KVCacheBlock]] = [[] for _ in range(num_tiers + 1)]
+        blocks_without_hash: list[KVCacheBlock] = []
+        time_fn = getattr(self, "_time_fn", time.monotonic)
+        now = time_fn()
+        protect_from = max(
+            0, len(blocks) - getattr(self, "_suffix_idle_protect_len", 0)
+        )
+        # Priority 0 (also the default when the body omits priority) keeps
+        # the first request behind every other free block. Pressure still
+        # reclaims it once nothing else is free.
+        protected_hashes = set(
+            self.session_tracker.first_request_hashes_for(session_id, now)
+        )
+        for idx, block in enumerate(blocks):
+            block.ref_cnt -= 1
+            if block.ref_cnt != 0 or block.is_null:
+                continue
+            if self._block_has_pinned_hash(block):
+                self._apply_pin_hold(block)
+                continue
+            if block.block_hash is None:
+                blocks_without_hash.append(block)
+                continue
+            block.freed_at = now
+            block.session_id = session_id
+            block.session_protected = (
+                block.block_hash is not None
+                and get_block_hash(block.block_hash) in protected_hashes
+            )
+            block.idle_protect = idx >= protect_from and protect_from < len(blocks)
+            if idx < first_tier_len:
+                block.evict_tier = 0
+                tiers[0].append(block)
+            elif tier_len > 0:
+                tier = 1 + (idx - first_tier_len) // tier_len
+                placed = min(tier, num_tiers)
+                block.evict_tier = placed
+                tiers[placed].append(block)
+            else:
+                block.evict_tier = num_tiers
+                tiers[num_tiers].append(block)
+
+        queue.prepend_n(blocks_without_hash)
+        for tier in range(num_tiers):
+            queue.append_n_to_tier(tiers[tier], tier)
+        queue.append_n(tiers[num_tiers])
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -828,6 +1050,83 @@ class BlockPool:
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
 
+    def set_pinned_hashes(self, hashes: Sequence[BlockHash]) -> tuple[int, int]:
+        """Replace the system-prompt pin set.
+
+        Matching cached blocks receive an extra ref and leave the free
+        queue. Blocks that no longer match are released. Returns
+        ``(newly_held, released)``.
+        """
+        new = set(hashes)
+        if new == self._pinned_hashes:
+            return self._hold_matching_unpinned(), 0
+        self._pinned_hashes = new
+        released = 0
+        for block in self.blocks:
+            if block.pinned and not self._block_has_pinned_hash(block):
+                self._release_pin_hold(block)
+                released += 1
+        return self._hold_matching_unpinned(), released
+
+    def clear_pinned_hashes(self) -> int:
+        """Drop every pin hold. Returns the number of released blocks."""
+        _, released = self.set_pinned_hashes(())
+        return released
+
+    @property
+    def pinned_hashes(self) -> frozenset[BlockHash]:
+        return frozenset(self._pinned_hashes)
+
+    def _block_has_pinned_hash(self, block: KVCacheBlock) -> bool:
+        if not self._pinned_hashes or block.is_null:
+            return False
+        if (
+            block.block_hash is not None
+            and get_block_hash(block.block_hash) in self._pinned_hashes
+        ):
+            return True
+        extras = self.cached_block_hashes_by_block.get(block.block_id)
+        if extras:
+            for key in extras:
+                if get_block_hash(key) in self._pinned_hashes:
+                    return True
+        return False
+
+    def _hold_matching_unpinned(self) -> int:
+        if not self._pinned_hashes:
+            return 0
+        held = 0
+        for block in self.blocks:
+            if block.pinned or block.is_null:
+                continue
+            if self._block_has_pinned_hash(block):
+                self._apply_pin_hold(block)
+                held += 1
+        return held
+
+    def _apply_pin_hold(self, block: KVCacheBlock) -> None:
+        if block.is_null or block.pinned:
+            return
+        on_free = (
+            block.prev_free_block is not None and block.next_free_block is not None
+        )
+        if on_free:
+            self.free_block_queue.remove(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt = 1
+        else:
+            block.ref_cnt += 1
+        block.pinned = True
+        block.freed_at = None
+
+    def _release_pin_hold(self, block: KVCacheBlock) -> None:
+        if not block.pinned:
+            return
+        block.pinned = False
+        block.ref_cnt -= 1
+        if block.ref_cnt == 0 and not block.is_null:
+            self.free_block_queue.append_n([block])
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
@@ -838,14 +1137,20 @@ class BlockPool:
             False otherwise.
 
         """
+        pin_only = sum(
+            1 for block in self.blocks if block.pinned and block.ref_cnt == 1
+        )
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
-        if num_used_blocks != 1:  # The null block is always marked as used
+        # The null block is always marked as used; pin holds also count.
+        if num_used_blocks - pin_only != 1:
             logger.warning(
                 "Failed to reset prefix cache because some "
                 "blocks (%d) are not freed yet",
-                num_used_blocks - 1,
+                num_used_blocks - pin_only - 1,
             )
             return False
+
+        self.clear_pinned_hashes()
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()

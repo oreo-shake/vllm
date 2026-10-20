@@ -397,15 +397,16 @@ class KVCacheCoordinator(ABC):
         )
         return all([pool.reset_prefix_cache() for pool in pools])
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, session_id: str | None = None) -> None:
         """Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            session_id: Optional conversation id for session-aware eviction.
 
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(request_id, session_id=session_id)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping from all single-type managers and

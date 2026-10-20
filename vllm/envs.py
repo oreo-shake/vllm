@@ -331,6 +331,34 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_ENABLE_HPC_OPS: bool = False
     VLLM_REQUEST_BODY_LOG_LEVEL: str = "DEBUG"
+    VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
+    VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
+    VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
+    VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
+    VLLM_SUFFIX_EVICTION_IDLE_DEMOTE: str = "all"
+    VLLM_SUFFIX_EVICTION_PROTECT_TOKENS: int = 0
+    VLLM_SUFFIX_SESSION_DEAD_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_EWA_ALPHA: float = 0.3
+    VLLM_SUFFIX_SESSION_DEAD_K: float = 3.0
+    VLLM_SUFFIX_SESSION_MIN_GAPS: int = 2
+    VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
+    VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
+    VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
+    VLLM_SESSION_TTL_LIMIT_S: float = 0.0
+    VLLM_SESSION_TTL_K: float = 1.0
+    VLLM_CPU_SESSION_TTL_S: str = ""
+    VLLM_CPU_SESSION_TTL_K: float = 2.0
+    VLLM_PIN_SYSTEM_PROMPT: bool = False
+    VLLM_PIN_MIN_REQUESTS: int = 8
+    VLLM_PIN_SHARE: float = 0.75
+    VLLM_PIN_DROP: float = 0.20
+    VLLM_PIN_MAX_TOKENS: int = 8192
+    VLLM_PIN_PROBE_TOKENS: int = 16384
+    VLLM_PIN_CONFIRM: int = 2
+    VLLM_PIN_WINDOW: int = 64
+    VLLM_PIN_MAX_CLUSTERS: int = 4
 
 
 def get_default_cache_root():
@@ -2261,6 +2289,115 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
         "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
     ).upper(),
+    # Evict the leading blocks of a freed request before any other cached
+    # block, and serve prefix-cache hits whose leading blocks were evicted by
+    # recomputing only the missing blocks. Requires prefix caching, a single
+    # full-attention KV cache group, no KV connector and no speculative
+    # decoding.
+    "VLLM_SUFFIX_PRESERVING_EVICTION": lambda: bool(
+        int(os.getenv("VLLM_SUFFIX_PRESERVING_EVICTION", "0"))
+    ),
+    # Fraction of a freed request's blocks, counted from its first block,
+    # that VLLM_SUFFIX_PRESERVING_EVICTION evicts first.
+    "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_PREFIX_FRACTION", "0.5")
+    ),
+    # When > 0, replaces the prefix fraction: the first this many tokens of
+    # every freed request are evicted before any other cached token, so small
+    # eviction demand falls on one request. Larger demand then grows every
+    # freed request's evicted region in steps of
+    # VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS (default: the same size).
+    "VLLM_SUFFIX_EVICTION_TIER_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_TOKENS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", "0")
+    ),
+    # Cap on the number of position eviction tiers. 0 = uncapped (one tier per
+    # step across max_model_len). When set, blocks past the last tier join the
+    # LRU tail so deep context stays recency-governed.
+    "VLLM_SUFFIX_EVICTION_MAX_TIERS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_MAX_TIERS", "0")
+    ),
+    # Seconds a freed cached block may sit idle before demotion into tier 0.
+    # 0 disables. Reclaims finished / long-idle sessions ahead of fresher
+    # later-tier content.
+    "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
+    ),
+    # How idle-TTL ages free blocks. Default ``all`` is the historical
+    # behavior (dump every expired unique block into tier 0, suffix too).
+    # ``protect`` skips the last PROTECT_TOKENS of each request.
+    # ``step`` moves one tier toward 0 per TTL instead of jumping to tier 0
+    # (also honors PROTECT_TOKENS). Session-dead wipe is unchanged.
+    "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE": lambda: os.getenv(
+        "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE", "all"
+    ),
+    # Last this many tokens of a freed request are not idle-demoted.
+    # 0 disables. 32768 keeps a 32K suffix hit after a long think.
+    "VLLM_SUFFIX_EVICTION_PROTECT_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_PROTECT_TOKENS", "0")
+    ),
+    # Session-aware full eviction. 0 disables. When a session's idle time
+    # since its last finished turn exceeds a threshold, its remaining unique
+    # KV is promoted for full eviction instead of another prefix-first peel.
+    # Threshold is always at least this floor. After MIN_GAPS samples the
+    # detector may raise it (ewa + K*std, or a server-wide quantile).
+    "VLLM_SUFFIX_SESSION_DEAD_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_TTL_S", "0")
+    ),
+    "VLLM_SUFFIX_SESSION_EWA_ALPHA": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_EWA_ALPHA", "0.3")
+    ),
+    "VLLM_SUFFIX_SESSION_DEAD_K": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_K", "3")
+    ),
+    "VLLM_SUFFIX_SESSION_MIN_GAPS": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_MIN_GAPS", "2")
+    ),
+    # ewa = per-session EWA + k·std (never below DEAD_TTL).
+    # global = server-wide think-time quantile (never below DEAD_TTL).
+    "VLLM_SUFFIX_SESSION_DETECTOR": lambda: os.getenv(
+        "VLLM_SUFFIX_SESSION_DETECTOR", "ewa"
+    ),
+    "VLLM_SUFFIX_SESSION_QUANTILE": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_QUANTILE", "0.95")
+    ),
+    "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
+    ),
+    # Priority-0 session cap. 0 disables (default) and leaves suffix
+    # eviction plus the think-time detector unchanged. When set, a
+    # priority-0 session is stale after max(TTL_LIMIT, K * EWMA gap).
+    # The gap is completion to the next arrival. EWMA alpha is
+    # VLLM_SUFFIX_SESSION_EWA_ALPHA. Priorities 1+ keep ordinary tiered
+    # eviction. First-request hashes are advisory metadata: no extra ref,
+    # and GPU pressure may evict those blocks before the TTL.
+    "VLLM_SESSION_TTL_LIMIT_S": lambda: float(
+        os.getenv("VLLM_SESSION_TTL_LIMIT_S", "0")
+    ),
+    "VLLM_SESSION_TTL_K": lambda: float(os.getenv("VLLM_SESSION_TTL_K", "1")),
+    # CPU tier bound in max(K * idle EWMA, bound). Empty means no bound.
+    # K multiplies the session's own idle-gap average. It does not scale
+    # the GPU TTL. CPU LRU and ARC do not read either value.
+    "VLLM_CPU_SESSION_TTL_S": lambda: os.getenv("VLLM_CPU_SESSION_TTL_S", ""),
+    "VLLM_CPU_SESSION_TTL_K": lambda: float(
+        os.getenv("VLLM_CPU_SESSION_TTL_K", "2")
+    ),
+    # Legacy coverage-cliff system-prompt pinning. The scheduler does not
+    # turn this on; priority-0 sessions use VLLM_SESSION_TTL_LIMIT_S
+    # instead. 0 is the default. The detector remains available to tests.
+    "VLLM_PIN_SYSTEM_PROMPT": lambda: bool(
+        int(os.getenv("VLLM_PIN_SYSTEM_PROMPT", "0"))
+    ),
+    "VLLM_PIN_MIN_REQUESTS": lambda: int(os.getenv("VLLM_PIN_MIN_REQUESTS", "8")),
+    "VLLM_PIN_SHARE": lambda: float(os.getenv("VLLM_PIN_SHARE", "0.75")),
+    "VLLM_PIN_DROP": lambda: float(os.getenv("VLLM_PIN_DROP", "0.20")),
+    "VLLM_PIN_MAX_TOKENS": lambda: int(os.getenv("VLLM_PIN_MAX_TOKENS", "8192")),
+    "VLLM_PIN_PROBE_TOKENS": lambda: int(os.getenv("VLLM_PIN_PROBE_TOKENS", "16384")),
+    "VLLM_PIN_CONFIRM": lambda: int(os.getenv("VLLM_PIN_CONFIRM", "2")),
+    "VLLM_PIN_WINDOW": lambda: int(os.getenv("VLLM_PIN_WINDOW", "64")),
+    "VLLM_PIN_MAX_CLUSTERS": lambda: int(os.getenv("VLLM_PIN_MAX_CLUSTERS", "4")),
 }
 
 
@@ -2422,6 +2559,34 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        "VLLM_SUFFIX_PRESERVING_EVICTION",
+        "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION",
+        "VLLM_SUFFIX_EVICTION_TIER_TOKENS",
+        "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
+        "VLLM_SUFFIX_EVICTION_MAX_TIERS",
+        "VLLM_SUFFIX_EVICTION_IDLE_TTL_S",
+        "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE",
+        "VLLM_SUFFIX_EVICTION_PROTECT_TOKENS",
+        "VLLM_SUFFIX_SESSION_DEAD_TTL_S",
+        "VLLM_SUFFIX_SESSION_EWA_ALPHA",
+        "VLLM_SUFFIX_SESSION_DEAD_K",
+        "VLLM_SUFFIX_SESSION_MIN_GAPS",
+        "VLLM_SUFFIX_SESSION_DETECTOR",
+        "VLLM_SUFFIX_SESSION_QUANTILE",
+        "VLLM_SUFFIX_SESSION_GAP_WINDOW",
+        "VLLM_SESSION_TTL_LIMIT_S",
+        "VLLM_SESSION_TTL_K",
+        "VLLM_CPU_SESSION_TTL_S",
+        "VLLM_CPU_SESSION_TTL_K",
+        "VLLM_PIN_SYSTEM_PROMPT",
+        "VLLM_PIN_MIN_REQUESTS",
+        "VLLM_PIN_SHARE",
+        "VLLM_PIN_DROP",
+        "VLLM_PIN_MAX_TOKENS",
+        "VLLM_PIN_PROBE_TOKENS",
+        "VLLM_PIN_CONFIRM",
+        "VLLM_PIN_WINDOW",
+        "VLLM_PIN_MAX_CLUSTERS",
     }
 
     from vllm.config.utils import normalize_value

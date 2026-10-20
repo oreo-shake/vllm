@@ -2939,6 +2939,203 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
+def test_suffix_preserving_eviction():
+    """Freed requests lose their leading blocks first, and a returning request
+    reuses its cached suffix while only its evicted blocks are recomputed."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(0.5)
+    free_queue = manager.block_pool.free_block_queue
+
+    def run(req: Request, num_tokens: int) -> list[int]:
+        computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req)
+        assert num_computed_tokens == 0
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+        return manager.get_block_ids(req.request_id)[0]
+
+    prompt0 = list(range(4 * block_size))
+    req0 = make_request("0", prompt0, block_size, sha256)
+    req1 = make_request("1", list(range(100, 100 + 4 * block_size)), block_size, sha256)
+    assert run(req0, 4 * block_size) == [1, 2, 3, 4]
+    assert run(req1, 4 * block_size) == [5, 6, 7, 8]
+    manager.free(req0)
+    manager.free(req1)
+    # Never-used blocks, then the first half of each request, then the rest.
+    assert [b.block_id for b in free_queue.get_all_free_blocks()] == [
+        9, 10, 1, 2, 5, 6, 3, 4, 7, 8,
+    ]  # fmt: skip
+
+    # Evict the first half of req0.
+    filler = make_request(
+        "f", list(range(200, 200 + 4 * block_size)), block_size, sha256
+    )
+    assert run(filler, 4 * block_size) == [9, 10, 1, 2]
+
+    # req0 returns with more tokens: blocks 2-3 hit, blocks 0-1 form the gap.
+    req0b = make_request("0b", prompt0 + [7] * 10, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0b)
+    assert num_computed_tokens == 0
+    assert [b.block_id for b in computed_blocks.blocks[0]] == [0, 0, 3, 4]
+    assert manager.get_suffix_hit(computed_blocks, 0) == (2 * block_size, 64)
+    assert manager.allocate_slots(req0b, 2 * block_size, 0, computed_blocks)
+    # The gap gets new blocks; the suffix keeps its cached blocks.
+    assert manager.get_block_ids("0b")[0] == [5, 6, 3, 4]
+    for idx, block_id in enumerate([5, 6, 3, 4]):
+        cached = manager.block_pool.get_cached_block(req0b.block_hashes[idx], [0])
+        assert cached is not None and cached[0].block_id == block_id
+    assert manager.coordinator.single_type_managers[0].num_cached_block["0b"] == 4
+
+    # After skipping the suffix, allocation continues after the last block.
+    req0b.num_computed_tokens = 4 * block_size
+    new_blocks = manager.allocate_slots(req0b, 10)
+    assert new_blocks is not None and new_blocks.get_block_ids() == ([7],)
+
+
+@pytest.mark.parametrize(
+    "first_tier_blocks,tier_blocks,demand,expected",
+    [
+        # Demand within one tier falls on the oldest freed request only.
+        (7, 7, 5, [5, 0, 0]),
+        # Filling tier 0 takes the same number of blocks from every request.
+        (7, 7, 21, [7, 7, 7]),
+        # Past tier 0, the next tier is shared in the same order.
+        (7, 7, 30, [14, 9, 7]),
+        # Steps smaller than tier 0 spread the remainder more finely.
+        (7, 2, 26, [9, 9, 8]),
+        # One tier covering whole requests evicts them one at a time.
+        (512, 512, 21, [18, 3, 0]),
+    ],
+)
+def test_suffix_preserving_eviction_tiers(
+    first_tier_blocks: int, tier_blocks: int, demand: int, expected: list[int]
+):
+    """Eviction demand is taken from the leading blocks of freed requests in
+    tiers, so each request loses a leading run of blocks."""
+    block_size = 16
+    lengths = [18, 21, 24]
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 1 + sum(lengths)),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(
+        0.5, first_tier_blocks * block_size, tier_blocks * block_size
+    )
+
+    def run(req: Request, num_tokens: int) -> None:
+        computed_blocks, _, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+
+    sessions = []
+    for i, num_blocks in enumerate(lengths):
+        prompt = list(range(1000 * i, 1000 * i + num_blocks * block_size))
+        req = make_request(str(i), prompt, block_size, sha256)
+        run(req, num_blocks * block_size)
+        sessions.append(req)
+    for req in sessions:
+        manager.free(req)
+
+    filler = make_request(
+        "f", list(range(10**5, 10**5 + demand * block_size)), block_size, sha256
+    )
+    run(filler, demand * block_size)
+
+    evicted = []
+    for req in sessions:
+        cached = [
+            manager.block_pool.get_cached_block(h, [0]) is not None
+            for h in req.block_hashes
+        ]
+        num_evicted = cached.index(True) if True in cached else len(cached)
+        assert all(cached[num_evicted:])
+        evicted.append(num_evicted)
+    assert evicted == expected
+
+
+def test_dead_session_full_evict_before_live_prefix():
+    """A predicted-dead session loses its leftover suffix before a live
+    session's prefix is peeled."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 1 + 8),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(
+        0.5,
+        2 * block_size,
+        2 * block_size,
+        session_dead_ttl_s=5.0,
+        session_ewa_alpha=1.0,
+        session_dead_k=0.0,
+        session_min_gaps=1,
+    )
+    clock = [0.0]
+    manager.block_pool._time_fn = lambda: clock[0]
+
+    def run(req: Request, num_tokens: int) -> None:
+        computed_blocks, _, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+
+    req_a = make_request(
+        "a", list(range(4 * block_size)), block_size, sha256, session_id="sessA"
+    )
+    req_b = make_request(
+        "b",
+        list(range(1000, 1000 + 4 * block_size)),
+        block_size,
+        sha256,
+        session_id="sessB",
+    )
+    manager.note_session_arrival(req_a)
+    run(req_a, 4 * block_size)
+    manager.note_session_arrival(req_b)
+    run(req_b, 4 * block_size)
+
+    clock[0] = 10.0
+    manager.free(req_a)
+    manager.free(req_b)
+
+    # A has a short observed think time. B finished later so it is still live.
+    state_a = manager.block_pool.session_tracker.states["sessA"]
+    state_a.n_gaps = 1
+    state_a.ewa_gap = 2.0
+    state_a.ewa_gap_sq = 4.0
+    state_a.last_arrival = 8.0
+    state_a.last_finish = 10.0
+    state_b = manager.block_pool.session_tracker.states["sessB"]
+    state_b.last_arrival = 16.0
+    state_b.last_finish = 18.0
+
+    # t=20: A idle=10 >= max(5, 2) → dead; B idle=2 < floor 5 → live.
+    clock[0] = 20.0
+    filler = make_request(
+        "f", list(range(10**5, 10**5 + 3 * block_size)), block_size, sha256
+    )
+    run(filler, 3 * block_size)
+
+    a_cached = [
+        manager.block_pool.get_cached_block(h, [0]) is not None
+        for h in req_a.block_hashes
+    ]
+    b_cached = [
+        manager.block_pool.get_cached_block(h, [0]) is not None
+        for h in req_b.block_hashes
+    ]
+    # Dead session A is fully (or almost fully) reclaimed first.
+    assert sum(a_cached) <= 1
+    # Live session B is untouched.
+    assert all(b_cached)
+
+
+
 def test_hash_block_correct_reuse():
     """This tests when a previously cached block is reused as a new block,
     its hash metadata should be correctly reset.

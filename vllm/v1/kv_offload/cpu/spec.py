@@ -158,6 +158,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            policy_kwargs = {
+                name: int(self.extra_config[name])
+                for name in ("first_tier_tokens", "tier_step_tokens", "max_tiers")
+                if name in self.extra_config
+            }
             self._manager = CPUOffloadingManager(
                 num_chunks=self.num_chunks,
                 cache_policy=self.eviction_policy,
@@ -165,6 +170,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                policy_kwargs=policy_kwargs or None,
             )
         return self._manager
 

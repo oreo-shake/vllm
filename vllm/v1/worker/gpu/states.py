@@ -124,6 +124,17 @@ class RequestState:
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
 
+    def sync_prefill_num_computed_tokens(self, req_ids: list[str]) -> None:
+        # Suffix-preserving eviction lets the scheduler advance a prefilling
+        # request past a cached suffix. The GPU value only advances by the query
+        # length, so overwrite it with the scheduler's (exact during prefill).
+        for req_id in req_ids:
+            req_idx = self.req_id_to_index[req_id]
+            num_computed = int(self.num_computed_tokens_np[req_idx])
+            if num_computed < self.prefill_len.np[req_idx]:
+                self.num_computed_tokens.stage_write_elem(req_idx, num_computed)
+        self.num_computed_tokens.apply_write()
+
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""
         req_idx = self.req_id_to_index.pop(req_id, None)

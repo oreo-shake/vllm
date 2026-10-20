@@ -89,3 +89,18 @@ CachePolicyFactory.register_cache_policy(
 CachePolicyFactory.register_cache_policy(
     "arc", "vllm.v1.kv_offload.cpu.policies.arc", "ARCCachePolicy"
 )
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning",
+    "vllm.v1.kv_offload.cpu.policies.prefix",
+    "PrefixPruningCachePolicy",
+)
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning_on_sessions",
+    "vllm.v1.kv_offload.cpu.policies.prefix",
+    "PrefixPruningOnSessionsCachePolicy",
+)
+CachePolicyFactory.register_cache_policy(
+    "first_request_pin",
+    "vllm.v1.kv_offload.cpu.policies.prefix",
+    "FirstRequestPinCachePolicy",
+)

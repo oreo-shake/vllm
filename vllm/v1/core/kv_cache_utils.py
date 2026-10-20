@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import (
@@ -184,6 +185,25 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Monotonic time when this block last entered the free queue as a cached
+    # (hashed) block. None for never-allocated blocks. Used by idle-TTL
+    # demotion under suffix-preserving eviction.
+    freed_at: float | None = None
+    # Session that last freed this cached block. Used to promote a predicted-
+    # dead session's remaining unique KV for full eviction.
+    session_id: str | None = None
+    # Evict-first tier this block was placed in at free time (0 = first peel,
+    # num_tiers = LRU tail). Used by stepwise idle demotion.
+    evict_tier: int | None = None
+    # Last N tokens of this request. Idle-TTL must not dump these to tier 0
+    # (session-dead wipe still may). Lets a long think keep a suffix hit.
+    idle_protect: bool = False
+    # Priority-0 first request (the default when the body omits priority).
+    # The free queue evicts these only after every unprotected free block.
+    session_protected: bool = False
+    # Extra ref held by automatic system-prompt pinning. Pinned blocks stay
+    # out of the free queue so the shared prefix is never recomputed.
+    pinned: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -517,6 +537,220 @@ class FreeKVCacheBlockQueue:
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
             yield curr_block
             curr_block = curr_block.next_free_block
+
+
+_TIER_BOUNDARY_BLOCK_ID = -2
+
+
+class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
+    """Free block queue with ordered evict-first tiers ahead of the LRU tier.
+
+    Boundary nodes split the list into `num_tiers` evict-first tiers followed
+    by the LRU tier: every block of tier i is evicted before any block of tier
+    i + 1, and the last evict-first tier before the LRU tier. `prepend_n` and
+    `append_n` keep their meaning; blocks passed to `append_n_to_tier` join the
+    end of that tier. The boundaries start at the tail, so blocks that were
+    never allocated are evicted before tier 0.
+    """
+
+    def __init__(self, blocks: list[KVCacheBlock], num_tiers: int = 1) -> None:
+        assert num_tiers >= 1
+        super().__init__(blocks)
+        self._boundaries = [
+            KVCacheBlock(block_id=_TIER_BOUNDARY_BLOCK_ID) for _ in range(num_tiers)
+        ]
+        prev_block = self.fake_free_list_tail.prev_free_block
+        assert prev_block is not None
+        for boundary in self._boundaries:
+            prev_block.next_free_block = boundary
+            boundary.prev_free_block = prev_block
+            prev_block = boundary
+        prev_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = prev_block
+
+    @property
+    def num_tiers(self) -> int:
+        return len(self._boundaries)
+
+    def popleft(self) -> KVCacheBlock:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        return self.popleft_n(1)[0]
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        # Priority-0 first-request blocks stay until nothing else is free.
+        ordered = list(self.iter_blocks_after(None))
+        if any(block.session_protected for block in ordered):
+            preferred = [block for block in ordered if not block.session_protected]
+            deferred = [block for block in ordered if block.session_protected]
+            chosen = (preferred + deferred)[:n]
+            for block in chosen:
+                self.remove(block)
+            return chosen
+        self.num_free_blocks -= n
+
+        passed_boundaries: list[KVCacheBlock] = []
+        curr_block = self.fake_free_list_head.next_free_block
+        ret = []
+        while len(ret) < n:
+            assert curr_block is not None
+            if curr_block.block_id == _TIER_BOUNDARY_BLOCK_ID:
+                passed_boundaries.append(curr_block)
+                curr_block = curr_block.next_free_block
+                continue
+            ret.append(curr_block)
+            next_block = curr_block.next_free_block
+            curr_block.prev_free_block = None
+            curr_block.next_free_block = None
+            curr_block = next_block
+
+        assert curr_block is not None
+        # Relink the passed boundaries, now empty tiers, ahead of curr_block.
+        prev_block = self.fake_free_list_head
+        for block in [*passed_boundaries, curr_block]:
+            prev_block.next_free_block = block
+            block.prev_free_block = prev_block
+            prev_block = block
+        return ret
+
+    def append_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        """Append blocks to the end of an evict-first tier."""
+        if len(blocks) == 0:
+            return
+        boundary = self._boundaries[tier]
+        prev_block = boundary.prev_free_block
+        assert prev_block is not None
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = boundary
+        boundary.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        """Insert blocks at the start of an evict-first tier.
+
+        For tier 0 this is after never-allocated blocks and before any other
+        cached tier-0 content, so a dead session is fully reclaimed before
+        a live session's prefix is peeled.
+        """
+        if len(blocks) == 0:
+            return
+        boundary = self._boundaries[tier]
+        if tier == 0:
+            insert_after = self.fake_free_list_head
+            curr = self.fake_free_list_head.next_free_block
+            while curr is not None and curr is not boundary:
+                if curr.block_id == _TIER_BOUNDARY_BLOCK_ID:
+                    break
+                if curr.freed_at is None and curr.block_hash is None:
+                    insert_after = curr
+                    curr = curr.next_free_block
+                    continue
+                break
+        else:
+            insert_after = self._boundaries[tier - 1]
+        nxt = insert_after.next_free_block
+        prev_block = insert_after
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = nxt
+        if nxt is not None:
+            nxt.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def demote_idle(
+        self,
+        ttl_s: float,
+        now: float | None = None,
+        mode: str = "all",
+    ) -> int:
+        """Age free blocks that have been idle for at least `ttl_s`.
+
+        Never-allocated blocks (`freed_at is None`) are left alone.
+
+        * ``all`` (default, historical): dump every expired hashed block into
+          tier 0, including the request's suffix. Finished / long-idle
+          sessions are reclaimed before fresher later-tier content.
+        * ``protect``: same dump, but skip ``idle_protect`` blocks (the last
+          N tokens of that request). Those stay in their current tier so a
+          returning long session can still suffix-hit.
+        * ``step``: move each expired unprotected block one tier toward 0
+          instead of jumping to tier 0. A suffix in a high tier takes many
+          TTLs to become evict-first. ``idle_protect`` blocks are skipped.
+
+        Session-dead promotion is a separate path and still full-wipes.
+        Returns the number of blocks that moved.
+        """
+        if ttl_s <= 0:
+            return 0
+        if mode not in ("all", "protect", "step"):
+            raise ValueError(
+                "idle demote mode must be 'all', 'protect', or 'step', "
+                f"got {mode}"
+            )
+        if now is None:
+            now = time.monotonic()
+        expired = [
+            block
+            for block in self.get_all_free_blocks()
+            if block.freed_at is not None and now - block.freed_at >= ttl_s
+        ]
+        if not expired:
+            return 0
+        if mode == "all":
+            for block in expired:
+                self.remove(block)
+                block.evict_tier = 0
+            self.append_n_to_tier(expired, 0)
+            return len(expired)
+
+        movable = [b for b in expired if not b.idle_protect]
+        if not movable:
+            return 0
+        if mode == "protect":
+            for block in movable:
+                self.remove(block)
+                block.evict_tier = 0
+            self.append_n_to_tier(movable, 0)
+            return len(movable)
+
+        by_dest: dict[int, list[KVCacheBlock]] = {}
+        for block in movable:
+            tier = block.evict_tier
+            if tier is None or tier <= 0:
+                continue
+            dest = tier - 1
+            by_dest.setdefault(dest, []).append(block)
+        moved = 0
+        for dest, blocks in by_dest.items():
+            for block in blocks:
+                self.remove(block)
+                block.evict_tier = dest
+            self.append_n_to_tier(blocks, dest)
+            moved += len(blocks)
+        return moved
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        return [
+            block
+            for block in super().get_all_free_blocks()
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID
+        ]
+
+    def iter_blocks_after(
+        self,
+        cursor: KVCacheBlock | None,
+    ) -> Iterator[KVCacheBlock]:
+        for block in super().iter_blocks_after(cursor):
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID:
+                yield block
 
 
 def _gen_mm_extra_hash_keys(

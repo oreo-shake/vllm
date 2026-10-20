@@ -8049,3 +8049,68 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+def test_suffix_preserving_eviction_skips_cached_suffix(monkeypatch):
+    """A request whose leading blocks were evicted computes only those blocks,
+    then resumes after its cached suffix."""
+    monkeypatch.setenv("VLLM_SUFFIX_PRESERVING_EVICTION", "1")
+    # CPU platforms round block_size up to a multiple of 32.
+    block_size = 32
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, num_blocks=11, block_size=block_size
+    )
+    init_none_hash(sha256)
+    block_hasher = get_request_block_hasher(block_size, sha256)
+
+    def make_request(req_id: str, prompt: list[int]) -> Request:
+        return Request(
+            request_id=req_id,
+            prompt_token_ids=prompt,
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            block_hasher=block_hasher,
+        )
+
+    def step(req: Request, num_tokens: int, sampled: list[int]) -> SchedulerOutput:
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {req.request_id: num_tokens}
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[req.request_id],
+                req_id_to_index={req.request_id: 0},
+                sampled_token_ids=[sampled],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return output
+
+    prompt0 = list(range(4 * block_size))
+    for req_id, prompt in [
+        ("0", prompt0),
+        ("1", list(range(100, 100 + 4 * block_size))),
+        # Evicts the first half of request 0.
+        ("filler", list(range(200, 200 + 4 * block_size))),
+    ]:
+        req = make_request(req_id, prompt)
+        scheduler.add_request(req)
+        step(req, len(prompt), [1])
+        assert req.is_finished()
+
+    req = make_request("0b", prompt0 + [7] * 10)
+    scheduler.add_request(req)
+
+    # The two evicted leading blocks are recomputed; the cached suffix is then
+    # skipped so num_computed jumps to the full prompt.
+    step(req, 2 * block_size, [])
+    assert req.prefill_stats is not None
+    assert req.prefill_stats.num_cached_tokens == 2 * block_size
+    assert req.num_computed_tokens == 4 * block_size
+    assert scheduler.kv_cache_manager.get_block_ids("0b") == ([5, 6, 3, 4],)
+
+    # The cached suffix is skipped.
+    output = step(req, 10, [1])
+    assert output.scheduled_cached_reqs.num_computed_tokens == [4 * block_size]
+    assert req.is_finished()

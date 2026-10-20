@@ -2,20 +2,31 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    UnitaryKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    trim_null_head,
+)
+from vllm.v1.core.prefix_pin import PinSnapshot, SystemPromptPinDetector
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -223,6 +234,266 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Set by `enable_suffix_preserving_eviction`.
+        self._suffix_hit_manager: FullAttentionManager | None = None
+        # Set by `enable_system_prompt_pin`. Independent of prefix-first.
+        self._prefix_pin: SystemPromptPinDetector | None = None
+
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float,
+        first_tier_tokens: int = 0,
+        tier_tokens: int = 0,
+        max_tiers: int = 0,
+        idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+        session_ttl_limit_s: float = 0.0,
+        session_ttl_k: float = 1.0,
+        idle_demote: str = "all",
+        idle_protect_tokens: int = 0,
+    ) -> None:
+        """Evict the leading blocks of freed requests first, and let
+        `get_computed_blocks` return hits whose leading blocks were evicted.
+
+        Args:
+            prefix_evict_fraction: Fraction of a freed request's blocks,
+                counted from its first block, that are evicted first. Used
+                when `first_tier_tokens` is 0.
+            first_tier_tokens: Leading tokens of every freed request that are
+                evicted before any other cached token.
+            tier_tokens: Size of each following eviction tier, so that the
+                evicted region grows across requests in steps of this many
+                tokens. Defaults to `first_tier_tokens`.
+            max_tiers: When > 0, cap the number of position tiers. Blocks past
+                the last tier join the LRU tail, so recency still governs the
+                deep body of each request.
+            idle_ttl_s: When > 0, free blocks idle at least this many seconds
+                are demoted into tier 0 before the next allocation, so finished
+                or long-idle sessions are reclaimed ahead of fresher later-tier
+                content.
+            session_dead_ttl_s: When > 0, enable session-aware full eviction.
+                A session idle past the detector threshold has all of its
+                remaining unique blocks promoted for eviction.
+            session_ewa_alpha: Smoothing for the per-session think-time EWA.
+            session_dead_k: For detector=ewa, dead if idle >=
+                max(floor, ewa + k * std).
+            session_min_gaps: Gaps required before the adaptive / quantile
+                threshold; fewer uses the static floor only.
+            session_detector: ``ewa`` (per-session) or ``global`` (server-wide
+                think-time quantile).
+            session_quantile: Quantile for detector=global (e.g. 0.95).
+            session_gap_window: Recent think times kept for the global
+                quantile.
+            session_ttl_limit_s: When > 0, priority-0 sessions go stale at
+                ``max(limit, K * EWMA gap)`` instead of the think-time
+                detector. 0 leaves that detector unchanged. Priorities 1+
+                stay on ordinary tiered eviction. First-request hashes are
+                advisory metadata and do not take an extra reference.
+            session_ttl_k: Multiplier on the priority-0 EWMA gap. EWMA alpha
+                is ``session_ewa_alpha``.
+            idle_demote: ``all`` dumps expired unique KV to tier 0 (historical).
+                ``protect`` skips the last ``idle_protect_tokens``. ``step``
+                ages one tier per TTL (also honors protect).
+            idle_protect_tokens: Last this many tokens of a freed request are
+                never idle-demoted. 0 disables. Session-dead wipe still can.
+        """
+        manager = self.coordinator.single_type_managers[0]
+        if (
+            not self.enable_caching
+            or not isinstance(self.coordinator, UnitaryKVCacheCoordinator)
+            or type(manager) is not FullAttentionManager
+        ):
+            raise ValueError(
+                "Suffix-preserving eviction requires prefix caching and a "
+                "single full-attention KV cache group."
+            )
+        block_size = manager.block_size
+        first_tier_len = first_tier_tokens // block_size
+        tier_len = (tier_tokens or first_tier_tokens) // block_size
+        if first_tier_tokens and (first_tier_len == 0 or tier_len == 0):
+            raise ValueError(
+                f"Suffix eviction tier sizes must be at least one block "
+                f"({block_size} tokens)."
+            )
+        if max_tiers < 0:
+            raise ValueError(f"max_tiers must be >= 0, got {max_tiers}")
+        if idle_ttl_s < 0:
+            raise ValueError(f"idle_ttl_s must be >= 0, got {idle_ttl_s}")
+        num_tiers = 1
+        if first_tier_len:
+            max_num_blocks = cdiv(self.max_model_len, block_size)
+            full_tiers = 1 + max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
+            num_tiers = min(full_tiers, max_tiers) if max_tiers > 0 else full_tiers
+        if session_dead_ttl_s < 0:
+            raise ValueError(
+                f"session_dead_ttl_s must be >= 0, got {session_dead_ttl_s}"
+            )
+        if session_ttl_limit_s < 0:
+            raise ValueError(
+                "session_ttl_limit_s must be >= 0, "
+                f"got {session_ttl_limit_s}"
+            )
+        if session_ttl_k < 0:
+            raise ValueError(f"session_ttl_k must be >= 0, got {session_ttl_k}")
+        if session_detector not in ("ewa", "global"):
+            raise ValueError(
+                f"session_detector must be 'ewa' or 'global', got {session_detector}"
+            )
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "idle_demote must be 'all', 'protect', or 'step', "
+                f"got {idle_demote}"
+            )
+        if idle_protect_tokens < 0:
+            raise ValueError(
+                f"idle_protect_tokens must be >= 0, got {idle_protect_tokens}"
+            )
+        idle_protect_len = idle_protect_tokens // block_size
+        self.block_pool.enable_prefix_first_eviction(
+            num_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
+            idle_demote=idle_demote,
+            idle_protect_len=idle_protect_len,
+            # First-request deferral is its own policy. Prefix tiers and
+            # the session-dead detector do not turn it on.
+            pin_first_request=session_ttl_limit_s > 0,
+        )
+        manager.enable_suffix_preserving_eviction(
+            prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
+        )
+        self._suffix_hit_manager = manager
+
+    def enable_system_prompt_pin(
+        self,
+        min_requests: int = 8,
+        share: float = 0.75,
+        drop: float = 0.20,
+        max_pin_tokens: int = 8192,
+        probe_tokens: int = 16384,
+        confirm: int = 2,
+        window: int = 64,
+        max_clusters: int = 4,
+    ) -> None:
+        """Detect the shared leading prefix and pin it against eviction.
+
+        Works with native LRU or prefix-first. Default-off; the scheduler
+        turns this on via ``VLLM_PIN_SYSTEM_PROMPT``.
+        """
+        if not self.enable_caching:
+            raise ValueError("System-prompt pinning requires prefix caching.")
+        block_size = self.block_pool.hash_block_size
+        max_pin_blocks = max(1, max_pin_tokens // block_size)
+        max_probe_blocks = max(max_pin_blocks, probe_tokens // block_size)
+        self._prefix_pin = SystemPromptPinDetector(
+            min_requests=min_requests,
+            share=share,
+            drop=drop,
+            max_pin_blocks=max_pin_blocks,
+            max_probe_blocks=max_probe_blocks,
+            confirm=confirm,
+            window=window,
+            max_clusters=max_clusters,
+        )
+        logger.info(
+            "System-prompt pin enabled (min_requests=%d, share=%.2f, "
+            "drop=%.2f, max_pin_tokens=%d, confirm=%d, window=%d).",
+            min_requests,
+            share,
+            drop,
+            max_pin_tokens,
+            confirm,
+            window,
+        )
+
+    def note_session_arrival(self, request: Request) -> None:
+        tracker = self.block_pool.session_tracker
+        if tracker.enabled:
+            # Only the priority-0 cap records a first-request prefix.
+            # Priority is forwarded as scheduling already stored it.
+            hashes = ()
+            priority = 0 if request.priority is None else request.priority
+            if priority == 0 and (
+                tracker.session_ttl_limit_s > 0 or tracker.pin_first_request
+            ):
+                hashes = tuple(request.block_hashes)
+            tracker.on_arrival(
+                request.session_id,
+                getattr(self.block_pool, "_time_fn", time.monotonic)(),
+                priority=priority,
+                first_request_hashes=hashes,
+            )
+        self.note_prefix_for_pin(request)
+
+    def note_prefix_for_pin(self, request: Request) -> PinSnapshot | None:
+        detector = self._prefix_pin
+        if detector is None:
+            return None
+        hashes = tuple(request.block_hashes)
+        if not hashes:
+            return None
+        session_id = request.session_id or request.request_id
+        snapshot = detector.observe(session_id, hashes)
+        if snapshot is None:
+            return None
+        held, released = self.block_pool.set_pinned_hashes(
+            cast(tuple[BlockHash, ...], snapshot.hashes)
+        )
+        if snapshot.hashes:
+            logger.info(
+                "Pinned system-prompt prefix: %d blocks "
+                "(held=%d released=%d clusters=%d n_obs=%d cliff=%d "
+                "coverage=%s).",
+                len(snapshot.hashes),
+                held,
+                released,
+                snapshot.clusters,
+                snapshot.n_obs,
+                snapshot.cliff,
+                ",".join(f"{c:.2f}" for c in snapshot.coverage[:8]),
+            )
+        else:
+            logger.info(
+                "Unpinned system-prompt prefix (released=%d, n_obs=%d).",
+                released,
+                snapshot.n_obs,
+            )
+        return snapshot
+
+    def get_suffix_hit(
+        self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
+    ) -> tuple[int, int] | None:
+        """Get the gap end and suffix end, in tokens, of a suffix hit returned by
+        `get_computed_blocks`, or None if the hit has no suffix.
+
+        Tokens in [num_prefix_hit_tokens, gap_end) must be computed before
+        the request can skip to suffix_end.
+        """
+        if self._suffix_hit_manager is None:
+            return None
+        blocks = computed_blocks.blocks[0]
+        block_size = self._suffix_hit_manager.block_size
+        gap_end = num_prefix_hit_tokens // block_size
+        if len(blocks) <= gap_end:
+            return None
+        while blocks[gap_end].is_null:
+            gap_end += 1
+        return gap_end * block_size, len(blocks) * block_size
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -270,8 +541,11 @@ class KVCacheManager:
 
         Returns:
             A tuple containing:
-                - A list of blocks that are computed for the request.
-                - The number of computed tokens.
+                - A list of blocks that are computed for the request. With
+                  suffix-preserving eviction, the prefix hit may be followed by
+                  null blocks for a gap and then cached suffix blocks; see
+                  `get_suffix_hit`.
+                - The number of computed tokens, excluding any suffix hit.
                 - ``shared_prefix_boundary``: the block-aligned token position of
                   a shared prefix that a sparse-retention group (Mamba / sliding
                   window) has not cached yet (Marconi-style APC), or 0 if none.
@@ -316,6 +590,21 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+
+        # Multimodal requests are excluded because encoder inputs are scheduled
+        # from a contiguous computed prefix.
+        if self._suffix_hit_manager is not None and not request.mm_features:
+            prefix_hit_blocks = computed_blocks[0]
+            suffix_hit = self._suffix_hit_manager.find_suffix_hit(
+                request.block_hashes, len(prefix_hit_blocks), max_cache_hit_length
+            )
+            if suffix_hit is not None:
+                suffix_start, suffix_blocks = suffix_hit
+                prefix_hit_blocks.extend(
+                    [self.block_pool.null_block]
+                    * (suffix_start - len(prefix_hit_blocks))
+                )
+                prefix_hit_blocks.extend(suffix_blocks)
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
@@ -626,7 +915,21 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
-        self.coordinator.free(request.request_id)
+        tracker = self.block_pool.session_tracker
+        if tracker.enabled:
+            now = getattr(self.block_pool, "_time_fn", time.monotonic)()
+            hashes = ()
+            priority = 0 if request.priority is None else request.priority
+            if priority == 0 and (
+                tracker.session_ttl_limit_s > 0 or tracker.pin_first_request
+            ):
+                hashes = tuple(request.block_hashes)
+            tracker.on_finish(
+                request.session_id,
+                now,
+                block_hashes=hashes,
+            )
+        self.coordinator.free(request.request_id, session_id=request.session_id)
 
     def remove_skipped_blocks(
         self,

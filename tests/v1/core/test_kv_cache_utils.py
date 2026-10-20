@@ -44,6 +44,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
@@ -760,6 +761,241 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_tiered_free_kv_cache_block_queue_evict_first_tier():
+    """Blocks in the evict-first tier are popped after never-used blocks and
+    before LRU blocks, regardless of the order in which they were freed."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(8)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:2])
+    queue.append_n([blocks[2], blocks[3]])
+    queue.append_n_to_tier([blocks[4], blocks[5]], 0)
+    queue.prepend_n([blocks[6]])
+    queue.append_n_to_tier([blocks[7]], 0)
+    assert queue.num_free_blocks == 8
+    expected = [6, 0, 1, 4, 5, 7, 2, 3]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Removing a block next to the tier boundary keeps both tiers linked.
+    queue.remove(blocks[7])
+    queue.remove(blocks[2])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [6, 0, 1, 4, 5, 3]
+
+    # Popping across the boundary skips it and keeps it usable.
+    assert [b.block_id for b in queue.popleft_n(5)] == [6, 0, 1, 4, 5]
+    assert queue.popleft() is blocks[3]
+    assert queue.num_free_blocks == 0
+    queue.append_n([blocks[0]])
+    queue.append_n_to_tier([blocks[1]], 0)
+    assert [b.block_id for b in queue.popleft_n(2)] == [1, 0]
+    with pytest.raises(ValueError):
+        queue.popleft()
+
+
+def test_tiered_queue_defers_priority_zero_first_request():
+    """A pinned first request is taken only after unprotected free blocks."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=1)
+    blocks[1].session_protected = True
+    blocks[2].session_protected = False
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n([blocks[2], blocks[3]])
+    assert [b.block_id for b in queue.popleft_n(3)] == [0, 2, 3]
+    assert queue.popleft() is blocks[1]
+
+
+def test_tiered_free_kv_cache_block_queue_multiple_tiers():
+    """Tiers are popped in order, each after the never-used blocks and before
+    the LRU tail, and popping across empty tiers keeps them usable."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(10)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=3)
+    queue.append_n([blocks[1]])
+    queue.append_n_to_tier([blocks[2], blocks[3]], 2)
+    queue.append_n_to_tier([blocks[4]], 0)
+    queue.append_n_to_tier([blocks[5]], 1)
+    queue.append_n_to_tier([blocks[6]], 0)
+    expected = [0, 4, 6, 5, 2, 3, 1]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Pop through tier 0 and tier 1 into tier 2, then refill the emptied tiers.
+    assert [b.block_id for b in queue.popleft_n(5)] == [0, 4, 6, 5, 2]
+    queue.append_n_to_tier([blocks[7]], 1)
+    queue.append_n_to_tier([blocks[8]], 0)
+    queue.append_n_to_tier([blocks[9]], 2)
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [8, 7, 3, 9, 1]
+
+    queue.remove(blocks[7])
+    assert [b.block_id for b in queue.popleft_n(4)] == [8, 3, 9, 1]
+    assert queue.num_free_blocks == 0
+    with pytest.raises(ValueError):
+        queue.popleft()
+
+
+def test_tiered_free_kv_cache_block_queue_demote_idle():
+    """Idle-TTL demotion moves expired later-tier / LRU blocks into tier 0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=2)
+    # never=0, tier0=1, tier1=2,3, LRU=4,5
+    blocks[1].freed_at = 100.0
+    blocks[2].freed_at = 100.0
+    blocks[3].freed_at = 200.0
+    blocks[4].freed_at = 100.0
+    blocks[5].freed_at = 200.0
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n_to_tier([blocks[2], blocks[3]], 1)
+    queue.append_n([blocks[4], blocks[5]])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 1, 2, 3, 4, 5]
+
+    # TTL=50 at now=160: expire 1,2,4 (freed_at=100); keep 3,5 (200).
+    n = queue.demote_idle(50.0, now=160.0)
+    assert n == 3
+    # never=0, then demoted into tier0 (1,2,4) after original tier0 empty of
+    # non-expired, then remaining tier1=3, LRU=5. Original tier0 block 1 was
+    # also expired and re-appended to tier0 with the others.
+    got = [b.block_id for b in queue.get_all_free_blocks()]
+    assert got[0] == 0
+    assert set(got[1:4]) == {1, 2, 4}
+    assert got[4:] == [3, 5]
+    # Expired blocks are popped before non-expired later-tier content.
+    assert [b.block_id for b in queue.popleft_n(4)] == got[:4]
+    assert [b.block_id for b in queue.popleft_n(2)] == [3, 5]
+
+
+def test_tiered_free_kv_cache_block_queue_demote_idle_protect():
+    """protect mode dumps expired blocks except idle_protect suffix."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=2)
+    for i, b in enumerate(blocks[1:], start=1):
+        b.freed_at = 100.0
+        b.evict_tier = 1 if i >= 2 else 0
+    blocks[3].idle_protect = True
+    blocks[4].idle_protect = True
+    blocks[3].evict_tier = 1
+    blocks[4].evict_tier = 2
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n_to_tier([blocks[2], blocks[3]], 1)
+    queue.append_n([blocks[4]])
+    n = queue.demote_idle(50.0, now=160.0, mode="protect")
+    assert n == 2
+    got = [b.block_id for b in queue.get_all_free_blocks()]
+    # never=0, original tier0 + demoted 2, then protected 3, then LRU 4.
+    assert got[0] == 0
+    assert 1 in got[1:3] and 2 in got[1:3]
+    assert got[3:] == [3, 4]
+    assert blocks[3].evict_tier == 1
+    assert blocks[4].evict_tier == 2
+
+
+def test_tiered_free_kv_cache_block_queue_demote_idle_step():
+    """step mode ages one tier per TTL and never moves idle_protect."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=2)
+    blocks[1].freed_at = 100.0
+    blocks[1].evict_tier = 0
+    blocks[2].freed_at = 100.0
+    blocks[2].evict_tier = 1
+    blocks[3].freed_at = 100.0
+    blocks[3].evict_tier = 2
+    blocks[4].freed_at = 100.0
+    blocks[4].evict_tier = 2
+    blocks[4].idle_protect = True
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n_to_tier([blocks[2]], 1)
+    queue.append_n([blocks[3], blocks[4]])
+    n = queue.demote_idle(50.0, now=160.0, mode="step")
+    # 1 already tier 0 (skip), 2:1→0, 3:2→1, 4 protected.
+    assert n == 2
+    assert blocks[2].evict_tier == 0
+    assert blocks[3].evict_tier == 1
+    assert blocks[4].evict_tier == 2
+    got = [b.block_id for b in queue.get_all_free_blocks()]
+    assert got[0] == 0
+    assert 1 in got[1:3] and 2 in got[1:3]
+    assert got[3] == 3
+    assert got[4] == 4
+
+
+def test_tiered_free_kv_cache_block_queue_prepend_n_to_tier():
+    """Dead-session blocks insert after never-used and before other tier 0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=1)
+    blocks[1].freed_at = 1.0
+    queue.append_n_to_tier([blocks[1]], 0)
+    blocks[2].freed_at = 1.0
+    blocks[3].freed_at = 1.0
+    queue.prepend_n_to_tier([blocks[2], blocks[3]], 0)
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 2, 3, 1]
+
+
+def test_session_liveness_ewa_threshold():
+    from vllm.v1.core.session_liveness import SessionLivenessTracker, resolve_session_id
+
+    assert resolve_session_id("body", {"X-Session-ID": "hdr"}) == "body"
+    assert resolve_session_id(headers={"X-Session-ID": "hdr"}) == "hdr"
+    assert resolve_session_id(extra_args={"session_id": "x"}) == "x"
+
+    tracker = SessionLivenessTracker(
+        min_ttl_s=50.0, ewa_alpha=1.0, dead_k=0.0, min_gaps=1
+    )
+    tracker.on_arrival("s", 0.0)
+    tracker.on_finish("s", 1.0)
+    # One gap of 2s → adaptive is 2, but the floor stays on: threshold=50.
+    tracker.on_arrival("s", 3.0)
+    tracker.on_finish("s", 4.0)
+    assert not tracker.is_dead("s", 53.0)
+    assert tracker.is_dead("s", 54.0)
+
+    # Adaptive above the floor wins.
+    high = SessionLivenessTracker(
+        min_ttl_s=5.0, ewa_alpha=1.0, dead_k=0.0, min_gaps=1
+    )
+    high.on_arrival("s", 0.0)
+    high.on_finish("s", 1.0)
+    high.on_arrival("s", 21.0)
+    high.on_finish("s", 22.0)
+    assert not high.is_dead("s", 41.9)
+    assert high.is_dead("s", 42.0)
+
+    # No samples yet: static floor.
+    tracker.on_arrival("cold", 0.0)
+    tracker.on_finish("cold", 1.0)
+    assert not tracker.is_dead("cold", 40.0)
+    assert tracker.is_dead("cold", 51.0)
+
+
+def test_session_liveness_global_quantile():
+    from vllm.v1.core.session_liveness import SessionLivenessTracker
+
+    # Other sessions think ~30s; a fast session thinks 2s. The bar is the
+    # server-wide 0.8 quantile (~30), not the fast session's own EWA.
+    tracker = SessionLivenessTracker(
+        min_ttl_s=5.0, min_gaps=2, detector="global", quantile=0.8, gap_window=32
+    )
+    for sid in ("x", "y", "z"):
+        tracker.on_arrival(sid, 0.0)
+        tracker.on_finish(sid, 1.0)
+        tracker.on_arrival(sid, 31.0)
+        tracker.on_finish(sid, 32.0)
+
+    tracker.on_arrival("fast", 0.0)
+    tracker.on_finish("fast", 1.0)
+    tracker.on_arrival("fast", 3.0)
+    tracker.on_finish("fast", 4.0)
+    # gaps=[30, 30, 30, 2] → q0.8 is 30; idle 16 < 30 so still live.
+    assert not tracker.is_dead("fast", 20.0)
+    assert tracker.is_dead("fast", 34.0)
+
+    # Same history under ewa would have killed "fast" at the floor.
+    ewa = SessionLivenessTracker(
+        min_ttl_s=5.0, ewa_alpha=1.0, dead_k=0.0, min_gaps=1
+    )
+    ewa.on_arrival("fast", 0.0)
+    ewa.on_finish("fast", 1.0)
+    ewa.on_arrival("fast", 3.0)
+    ewa.on_finish("fast", 4.0)
+    assert ewa.is_dead("fast", 9.0)
 
 
 def test_generate_block_hash_extra_keys():

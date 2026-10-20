@@ -11,6 +11,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
@@ -587,11 +588,12 @@ class SingleTypeKVCacheManager(ABC):
         self._partial_hit_reqs.pop(request_id, None)
         return trim_null_head(req_blocks)
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, session_id: str | None = None) -> None:
         """Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            session_id: Optional conversation id for session-aware eviction.
 
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
@@ -738,6 +740,161 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Set by `enable_suffix_preserving_eviction`.
+        self._prefix_evict_fraction: float | None = None
+        self._first_tier_len = 0
+        self._tier_len = 0
+        # {req_id: (gap_end_block, suffix_end_block)} for requests admitted
+        # with a suffix hit whose gap blocks are not all cached yet.
+        self._suffix_hit_reqs: dict[str, tuple[int, int]] = {}
+
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float,
+        first_tier_len: int = 0,
+        tier_len: int = 0,
+    ) -> None:
+        """Free requests prefix-first and accept suffix hits.
+
+        With `first_tier_len` == 0, the leading `prefix_evict_fraction` of a
+        freed request's blocks form evict-first tier 0. Otherwise its first
+        `first_tier_len` blocks form tier 0 and each following run of
+        `tier_len` blocks the next tier; see `BlockPool.free_blocks_tiered`.
+
+        A suffix hit is passed to `add_local_computed_blocks` as the prefix
+        hit, then one null block per missing block (the gap), then the cached
+        suffix blocks. The gap is filled with new blocks there.
+        """
+        assert type(self) is FullAttentionManager
+        assert self.block_size == self.block_pool.hash_block_size
+        assert self.dcp_world_size == 1 and self.pcp_world_size == 1
+        assert 0.0 <= prefix_evict_fraction <= 1.0
+        assert first_tier_len >= 0 and tier_len >= 0
+        self._prefix_evict_fraction = prefix_evict_fraction
+        self._first_tier_len = first_tier_len
+        self._tier_len = tier_len
+
+    def find_suffix_hit(
+        self,
+        block_hashes: Sequence[BlockHash],
+        num_prefix_hit_blocks: int,
+        max_length: int,
+    ) -> tuple[int, list[KVCacheBlock]] | None:
+        """Find the first run of cached blocks after the prefix hit.
+
+        Args:
+            block_hashes: The block hashes of the request.
+            num_prefix_hit_blocks: The length of the prefix hit in blocks.
+            max_length: The maximum cache hit length in tokens.
+
+        Returns:
+            The index of the first block of the run and the blocks of the run,
+            or None if no block after the prefix hit is cached.
+        """
+        max_num_blocks = min(max_length // self.block_size, len(block_hashes))
+        group_ids = [self.kv_cache_group_id]
+        suffix_start: int | None = None
+        suffix_blocks: list[KVCacheBlock] = []
+        # Block `num_prefix_hit_blocks` is the miss that ended the prefix hit.
+        for idx in range(num_prefix_hit_blocks + 1, max_num_blocks):
+            cached = self.block_pool.get_cached_block(block_hashes[idx], group_ids)
+            if cached is None:
+                if suffix_start is not None:
+                    break
+                continue
+            if suffix_start is None:
+                suffix_start = idx
+            suffix_blocks.append(cached[0])
+        if suffix_start is None:
+            return None
+        return suffix_start, suffix_blocks
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> int:
+        num_blocks = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )
+        if self._prefix_evict_fraction is not None:
+            # Gap placeholders of a suffix hit get new blocks on admission.
+            num_blocks += sum(blk.is_null for blk in new_computed_blocks)
+        return num_blocks
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        gap_start = num_local_computed_tokens // self.block_size
+        if (
+            self._prefix_evict_fraction is None
+            or len(new_computed_blocks) <= gap_start
+            or not new_computed_blocks[gap_start].is_null
+        ):
+            super().add_local_computed_blocks(
+                request_id,
+                new_computed_blocks,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+            return
+
+        assert num_external_computed_tokens == 0
+        assert num_local_computed_tokens % self.block_size == 0
+        req_blocks = self.req_to_blocks[request_id]
+        assert len(req_blocks) == 0
+        gap_end = gap_start
+        while new_computed_blocks[gap_end].is_null:
+            gap_end += 1
+
+        # Touch the hits before allocating so the allocation cannot evict them.
+        self.block_pool.touch(new_computed_blocks[:gap_start])
+        self.block_pool.touch(new_computed_blocks[gap_end:])
+        gap_blocks = self.block_pool.get_new_blocks(gap_end - gap_start)
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(blk.block_id for blk in gap_blocks)
+
+        req_blocks.extend(new_computed_blocks[:gap_start])
+        req_blocks.extend(gap_blocks)
+        req_blocks.extend(new_computed_blocks[gap_end:])
+        self.num_cached_block[request_id] = gap_start
+        self._suffix_hit_reqs[request_id] = (gap_end, len(req_blocks))
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._suffix_hit_reqs.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+    def free(self, request_id: str, session_id: str | None = None) -> None:
+        if self._prefix_evict_fraction is None:
+            super().free(request_id, session_id=session_id)
+            return
+        blocks = self.pop_blocks_for_free(request_id)
+        first_tier_len = self._first_tier_len or int(
+            len(blocks) * self._prefix_evict_fraction
+        )
+        self.block_pool.free_blocks_tiered(
+            blocks, first_tier_len, self._tier_len, session_id=session_id
+        )
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -844,6 +1001,21 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        suffix_hit = self._suffix_hit_reqs.get(request.request_id)
+        if suffix_hit is not None:
+            gap_end_block, suffix_end_block = suffix_hit
+            gap_end = gap_end_block * self.block_size
+            super().cache_blocks(
+                request,
+                min(num_tokens, gap_end),
+                retention_interval=retention_interval,
+                replay_boundaries=replay_boundaries,
+            )
+            if num_tokens < gap_end:
+                return
+            # The suffix blocks are cached already.
+            del self._suffix_hit_reqs[request.request_id]
+            self.num_cached_block[request.request_id] = suffix_end_block
         super().cache_blocks(
             request,
             num_tokens,

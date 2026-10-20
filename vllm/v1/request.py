@@ -83,7 +83,9 @@ class Request:
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
-        self.priority = priority
+        # Omitted priority is 0, so a priority-0 first-request pin applies
+        # without the client sending the field.
+        self.priority = 0 if priority is None else priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
@@ -96,6 +98,13 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.session_id = session_id
+        if self.session_id is None and sampling_params is not None:
+            extra_args = sampling_params.extra_args
+            if extra_args is not None:
+                extra_sid = extra_args.get("session_id")
+                if isinstance(extra_sid, str) and extra_sid:
+                    self.session_id = extra_sid
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -194,7 +203,6 @@ class Request:
         self.all_token_ids = ConstantList(self._all_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
-        self.session_id = session_id
         self.kv_hints = kv_hints
 
         # True if this request is scheduled as a non-final prefill chunk.

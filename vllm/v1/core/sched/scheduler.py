@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -38,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.session_liveness import SessionLivenessTracker
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -358,6 +360,33 @@ class Scheduler(SchedulerInterface):
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+
+        # {req_id: (gap_end, suffix_end)} in tokens, for scheduled requests
+        # admitted with a suffix hit that have not computed their gap yet.
+        self._suffix_hits: dict[str, tuple[int, int]] = {}
+        # CPU runs that start after a hole. Absent for lru and arc.
+        self._offload_spans: dict[str, list[tuple[int, int]]] = {}
+        if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
+            self._enable_suffix_preserving_eviction()
+        elif self._cpu_policy_needs_idle_average():
+            # GPU stays on LRU. Record session idle gaps so a CPU policy
+            # can use them. The free queue is not replaced.
+            self.kv_cache_manager.block_pool.session_tracker = (
+                SessionLivenessTracker(observe_idle=True)
+            )
+        if self.connector is not None:
+            attach = getattr(self.connector, "attach_session_tracker", None)
+            if attach is not None:
+                attach(self.kv_cache_manager.block_pool.session_tracker)
+        # Coverage-cliff system-prompt pinning is not the default path.
+        # Priority-0 first-request metadata lives on the suffix-preserving
+        # tracker and does not take an extra reference count.
+        if envs.VLLM_PIN_SYSTEM_PROMPT:
+            logger.info(
+                "VLLM_PIN_SYSTEM_PROMPT is set, but coverage-cliff pinning "
+                "stays off. Priority-0 first-request protection follows "
+                "VLLM_SESSION_TTL_LIMIT_S and remains advisory."
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -755,11 +784,28 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if self._requeue_for_offload_span(request, req_index):
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # pause=True: under async scheduling, num_computed_tokens advances
+            # when the last hole chunk is scheduled while tokens are still
+            # in flight. Without pausing, clip would drop the CPU span and
+            # recompute it. Pause until in-flight drains, then requeue loads.
+            num_new_tokens = self._clip_to_offload_span(
+                request,
+                num_new_tokens,
+                request.num_computed_tokens,
+                pause=True,
+            )
+            if (suffix_hit := self._suffix_hits.get(request.request_id)) is not None:
+                num_new_tokens = min(
+                    num_new_tokens, suffix_hit[0] - request.num_computed_tokens
+                )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -1010,6 +1056,9 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                suffix_hit = None
+                num_suffix_hit_tokens = 0
+                cpu_hit_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1020,6 +1069,11 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    suffix_hit = self.kv_cache_manager.get_suffix_hit(
+                        new_computed_blocks, num_new_local_computed_tokens
+                    )
+                    if suffix_hit is not None:
+                        num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1091,10 +1145,38 @@ class Scheduler(SchedulerInterface):
                                 request.shared_prefix_boundary,
                             ) = self.kv_cache_manager.get_computed_blocks(request)
 
+                        # This discovery owns the deferred plan. Replace any
+                        # spans left from a prior failed admission of the same
+                        # waiting request; never extend (that doubles deferred
+                        # tokens and trips prefill_stats asserts).
+                        take_spans = getattr(
+                            self.connector, "take_offload_spans", None
+                        )
+                        # Require a real callable that returns a sequence.
+                        # Mock connectors auto-create attributes whose return
+                        # value is not iterable.
+                        if callable(take_spans):
+                            spans = take_spans(request)
+                            if isinstance(spans, (list, tuple)) and spans:
+                                self._offload_spans[request.request_id] = list(spans)
+                            else:
+                                self._offload_spans.pop(request.request_id, None)
+
+                        # Contiguous external tokens load immediately.
+                        # Deferred span tokens are also CPU hits; they load
+                        # after the hole in front is recomputed. Count both
+                        # here so external hit rate stays consistent.
+                        deferred_span_tokens = self._pending_offload_span_tokens(
+                            request.request_id
+                        )
+                        cpu_hit_tokens = (
+                            num_external_computed_tokens + deferred_span_tokens
+                        )
+
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
-                        connector_prefix_cache_hits = num_external_computed_tokens
+                        connector_prefix_cache_hits = cpu_hit_tokens
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1131,8 +1213,12 @@ class Scheduler(SchedulerInterface):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens + num_suffix_hit_tokens
+                            ),
+                            num_external_cached_tokens=cpu_hit_tokens
+                            if self.connector is not None
+                            else num_external_computed_tokens,
                         )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
@@ -1149,6 +1235,24 @@ class Scheduler(SchedulerInterface):
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         skip_request(request_queue)
                         continue
+
+                    # A CPU run sits at this cursor. The first lookup only
+                    # runs when num_computed_tokens == 0, so a request that
+                    # was requeued after recomputing the hole must ask again
+                    # or the span is never loaded.
+                    span_load = self._match_offload_span(request, num_computed_tokens)
+                    if span_load is not None:
+                        ext_tokens, span_async = span_load
+                        if ext_tokens is None:
+                            skip_request(request_queue)
+                            continue
+                        num_external_computed_tokens = ext_tokens
+                        load_kv_async = span_async
+                        num_computed_tokens = num_computed_tokens + ext_tokens
+                        # Deferred span hits were already counted on the
+                        # first lookup; do not inflate queries/hits again.
+                        connector_prefix_cache_queries = 0
+                        connector_prefix_cache_hits = 0
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1182,6 +1286,11 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if suffix_hit is not None:
+                        num_new_tokens = suffix_hit[0] - num_computed_tokens
+                    num_new_tokens = self._clip_to_offload_span(
+                        request, num_new_tokens, num_computed_tokens
+                    )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1371,7 +1480,8 @@ class Scheduler(SchedulerInterface):
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
-                        request, num_new_local_computed_tokens
+                        request,
+                        num_new_local_computed_tokens + num_suffix_hit_tokens,
                     )
 
                 if load_kv_async:
@@ -1430,6 +1540,17 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if suffix_hit is not None:
+                    self._suffix_hits[request_id] = suffix_hit
+                    logger.debug(
+                        "Request %s: suffix hit, computing tokens [%d, %d) "
+                        "then skipping cached tokens [%d, %d).",
+                        request_id,
+                        num_computed_tokens,
+                        suffix_hit[0],
+                        suffix_hit[0],
+                        suffix_hit[1],
+                    )
                 self._set_kv_fetch_stage(request, None)
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
@@ -1707,6 +1828,11 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            suffix_hit = self._suffix_hits.get(req_id)
+            if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
+                # The gap is scheduled; skip over the cached suffix.
+                del self._suffix_hits[req_id]
+                request.num_computed_tokens = suffix_hit[1]
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2721,6 +2847,7 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            self.kv_cache_manager.note_session_arrival(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
@@ -2854,10 +2981,258 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         )
 
+    def _enable_suffix_preserving_eviction(self) -> None:
+        unsupported = []
+        if self.connector is not None:
+            unsupported.append("KV connectors")
+        if self.vllm_config.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            unsupported.append("pipeline parallelism")
+        if self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            unsupported.append("context parallelism")
+        if self.is_encoder_decoder:
+            unsupported.append("encoder-decoder models")
+        if unsupported:
+            raise ValueError(
+                "VLLM_SUFFIX_PRESERVING_EVICTION does not support "
+                + ", ".join(unsupported)
+            )
+        fraction = envs.VLLM_SUFFIX_EVICTION_PREFIX_FRACTION
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION must be in [0, 1], "
+                f"got {fraction}"
+            )
+        tier_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_TOKENS
+        step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
+        max_tiers = envs.VLLM_SUFFIX_EVICTION_MAX_TIERS
+        idle_ttl_s = envs.VLLM_SUFFIX_EVICTION_IDLE_TTL_S
+        session_dead_ttl_s = envs.VLLM_SUFFIX_SESSION_DEAD_TTL_S
+        session_ewa_alpha = envs.VLLM_SUFFIX_SESSION_EWA_ALPHA
+        session_dead_k = envs.VLLM_SUFFIX_SESSION_DEAD_K
+        session_min_gaps = envs.VLLM_SUFFIX_SESSION_MIN_GAPS
+        session_detector = envs.VLLM_SUFFIX_SESSION_DETECTOR
+        session_quantile = envs.VLLM_SUFFIX_SESSION_QUANTILE
+        session_gap_window = envs.VLLM_SUFFIX_SESSION_GAP_WINDOW
+        session_ttl_limit_s = envs.VLLM_SESSION_TTL_LIMIT_S
+        session_ttl_k = envs.VLLM_SESSION_TTL_K
+        idle_demote = envs.VLLM_SUFFIX_EVICTION_IDLE_DEMOTE
+        idle_protect_tokens = envs.VLLM_SUFFIX_EVICTION_PROTECT_TOKENS
+        if tier_tokens < 0 or step_tokens < 0:
+            raise ValueError("Suffix eviction tier sizes must not be negative")
+        if max_tiers < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_MAX_TIERS must not be negative")
+        if idle_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
+        if session_dead_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_DEAD_TTL_S must not be negative")
+        if session_ttl_limit_s < 0:
+            raise ValueError("VLLM_SESSION_TTL_LIMIT_S must not be negative")
+        if session_ttl_k < 0:
+            raise ValueError("VLLM_SESSION_TTL_K must not be negative")
+        if not 0.0 < session_ewa_alpha <= 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_EWA_ALPHA must be in (0, 1], "
+                f"got {session_ewa_alpha}"
+            )
+        if session_dead_k < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_DEAD_K must not be negative")
+        if session_min_gaps < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_MIN_GAPS must not be negative")
+        if session_detector not in ("ewa", "global"):
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_DETECTOR must be 'ewa' or 'global', "
+                f"got {session_detector}"
+            )
+        if not 0.0 < session_quantile < 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_SESSION_QUANTILE must be in (0, 1), "
+                f"got {session_quantile}"
+            )
+        if session_gap_window < 1:
+            raise ValueError("VLLM_SUFFIX_SESSION_GAP_WINDOW must be >= 1")
+        if idle_demote not in ("all", "protect", "step"):
+            raise ValueError(
+                "VLLM_SUFFIX_EVICTION_IDLE_DEMOTE must be 'all', 'protect', "
+                f"or 'step', got {idle_demote}"
+            )
+        if idle_protect_tokens < 0:
+            raise ValueError(
+                "VLLM_SUFFIX_EVICTION_PROTECT_TOKENS must not be negative"
+            )
+        self.kv_cache_manager.enable_suffix_preserving_eviction(
+            fraction,
+            tier_tokens,
+            step_tokens,
+            max_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+            session_ttl_limit_s=session_ttl_limit_s,
+            session_ttl_k=session_ttl_k,
+            idle_demote=idle_demote,
+            idle_protect_tokens=idle_protect_tokens,
+        )
+        if tier_tokens:
+            logger.info(
+                "Suffix-preserving eviction enabled with eviction tiers of %d "
+                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s, "
+                "idle_demote=%s, protect_tokens=%s, "
+                "session_dead_ttl_s=%s, detector=%s, "
+                "session_ttl_limit_s=%s, session_ttl_k=%s).",
+                tier_tokens,
+                step_tokens or tier_tokens,
+                max_tiers or "uncapped",
+                idle_ttl_s or "off",
+                idle_demote,
+                idle_protect_tokens or "off",
+                session_dead_ttl_s or "off",
+                session_detector if session_dead_ttl_s else "off",
+                session_ttl_limit_s or "off",
+                session_ttl_k if session_ttl_limit_s else "off",
+            )
+        else:
+            logger.info(
+                "Suffix-preserving eviction enabled with prefix fraction %.2f "
+                "(idle_ttl_s=%s, session_dead_ttl_s=%s, "
+                "session_ttl_limit_s=%s, session_ttl_k=%s).",
+                fraction,
+                idle_ttl_s or "off",
+                session_dead_ttl_s or "off",
+                session_ttl_limit_s or "off",
+                session_ttl_k if session_ttl_limit_s else "off",
+            )
+
+    def _cpu_policy_needs_idle_average(self) -> bool:
+        """True when the CPU tier is not LRU or ARC.
+
+        Those two policies do not read session idle time. Any other CPU
+        policy needs the GPU-side gap average, including when GPU eviction
+        itself stays LRU.
+        """
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is None:
+            return False
+        policy = transfer.get_from_extra_config("eviction_policy", "lru")
+        return policy not in ("lru", "arc")
+
+    def _pending_offload_span_tokens(self, request_id: str) -> int:
+        """Tokens covered by deferred CPU runs waiting behind a hole."""
+        spans = self._offload_spans.get(request_id)
+        if not spans:
+            return 0
+        return sum(end - start for start, end in spans)
+
+    def _requeue_for_offload_span(self, request: Request, req_index: int) -> bool:
+        """Send a request back to waiting so a CPU run can load contiguously.
+
+        LRU and ARC never fill ``_offload_spans``, so this is a no-op for them.
+        The GPU suffix jump is a different path and is not used here.
+        """
+        spans = self._offload_spans.get(request.request_id)
+        if not spans or request.num_in_flight_tokens != 0:
+            return False
+        start, end = spans[0]
+        if request.num_computed_tokens >= end:
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._requeue_for_offload_span(request, req_index)
+        if request.num_computed_tokens < start:
+            return False
+        self.running.pop(req_index)
+        request.status = RequestStatus.WAITING
+        self.waiting.prepend_request(request)
+        return True
+
+    def _match_offload_span(
+        self, request: Request, num_computed: int
+    ) -> tuple[int | None, bool] | None:
+        """Load a CPU run that the request has already reached.
+
+        Returns None when no span is waiting at this cursor. Otherwise
+        returns the connector's ``(external_tokens, load_async)``. A run
+        the connector will not load is dropped so the scheduler recomputes
+        it instead of scheduling zero tokens.
+
+        The deferred plan in ``_offload_spans`` was fixed at the initial
+        tier lookup. A mid-request connector lookup may rediscover later
+        runs; those must be discarded, not merged, or the same intervals
+        are ingested twice.
+        """
+        spans = self._offload_spans.get(request.request_id)
+        if self.connector is None or not spans or num_computed < spans[0][0]:
+            return None
+        ext_tokens, load_async = self.connector.get_num_new_matched_tokens(
+            request, num_computed
+        )
+        # Drop rediscovered deferred runs from this lookup; do not extend
+        # the scheduler plan (that plan is already authoritative).
+        take_spans = getattr(self.connector, "take_offload_spans", None)
+        if take_spans is not None:
+            take_spans(request)
+        if ext_tokens is None:
+            return None, False
+        if ext_tokens > 0:
+            loaded_until = num_computed + ext_tokens
+            while spans and spans[0][0] < loaded_until:
+                start, end = spans[0]
+                if end > loaded_until:
+                    spans[0] = (loaded_until, end)
+                    break
+                spans.pop(0)
+        else:
+            spans.pop(0)
+        if not spans:
+            self._offload_spans.pop(request.request_id, None)
+        return ext_tokens, load_async
+
+    def _clip_to_offload_span(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_computed: int,
+        pause: bool = False,
+    ) -> int:
+        """Stop a prefill chunk at the next CPU run so the hole is recomputed."""
+        spans = self._offload_spans.get(request.request_id)
+        if not spans or num_new_tokens <= 0:
+            return num_new_tokens
+        start, end = spans[0]
+        if num_computed >= end:
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._clip_to_offload_span(
+                request, num_new_tokens, num_computed, pause
+            )
+        if num_computed >= start:
+            # Inside a cached CPU run. The running loop must pause
+            # (pause=True) until in-flight hole tokens drain and
+            # _requeue_for_offload_span can load the run. The waiting
+            # path keeps pause=False: a run left here is recomputed.
+            if pause:
+                return 0
+            spans.pop(0)
+            if not spans:
+                self._offload_spans.pop(request.request_id, None)
+            return self._clip_to_offload_span(
+                request, num_new_tokens, num_computed, pause
+            )
+        return min(num_new_tokens, start - num_computed)
+
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._suffix_hits.pop(request.request_id, None)
+        self._offload_spans.pop(request.request_id, None)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return

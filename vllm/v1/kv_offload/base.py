@@ -94,6 +94,12 @@ class ReqContext:
     kv_transfer_params: dict[str, Any] | None = None
     kv_hints: KvHintsEnvelope | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
+    session_id: str | None = None
+    # Omitted priority is 0. Only the CPU first-request pin reads this.
+    priority: int = 0
+    block_hashes: tuple[Any, ...] = ()
+    # Token index of each offload key, filled by the connector before touch.
+    token_positions: dict[OffloadKey, int] | None = None
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params and kv_hints once (in on_new_request) and read the
     # result back on later calls for the same request.

@@ -382,6 +382,9 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Later CPU runs that are not contiguous with the GPU cursor.
+    # Empty for lru and arc.
+    offload_spans: list[tuple[int, int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -552,11 +555,15 @@ def _create_req_context(req: Request) -> ReqContext:
         raw = params.get(KV_LOAD_TIERS_KEY)
         if raw is not None:
             load_filter = _parse_tier_filter(raw)
+    priority = 0 if req.priority is None else req.priority
     return ReqContext(
         req_id=req.request_id,
         kv_transfer_params=params,
         kv_hints=req.kv_hints,
         load_tier_filter=load_filter,
+        session_id=req.session_id,
+        priority=priority,
+        block_hashes=tuple(req.block_hashes),
     )
 
 
@@ -774,6 +781,56 @@ class OffloadingConnectorScheduler:
                     break
         return hit_count if not defer_lookup else None
 
+    def _span_lookup(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> tuple[int | None, list[tuple[int, int]]]:
+        """Cached runs in ``keys``.
+
+        The first element is the length of the run that starts at index 0,
+        or None when a lookup must be retried. Later ``[start, end)`` runs
+        are the holes the scheduler recomputes before loading. LRU and ARC
+        do not call this.
+        """
+        runs: list[tuple[int, int]] = []
+        start: int | None = None
+        defer = False
+        for index, key in enumerate(keys):
+            match self.manager.lookup(key, req_context):
+                case LookupResult.HIT | LookupResult.HIT_PENDING:
+                    if start is None:
+                        start = index
+                case LookupResult.RETRY:
+                    defer = True
+                    if start is not None:
+                        runs.append((start, index))
+                        start = None
+                case LookupResult.MISS:
+                    if start is not None:
+                        runs.append((start, index))
+                        start = None
+        if start is not None:
+            runs.append((start, len(keys)))
+        if defer:
+            return None, []
+        if runs and runs[0][0] == 0:
+            return runs[0][1], runs[1:]
+        return 0, runs
+
+    def take_offload_spans(self, request: Request) -> list[tuple[int, int]]:
+        """Pop deferred CPU runs from the latest lookup. Empty for lru/arc.
+
+        Each successful ``_lookup`` replaces ``offload_spans`` with the
+        deferred runs discovered on that call. The scheduler must treat the
+        returned list as the full deferred plan for that discovery (assign /
+        replace), not extend it onto a previous take.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or not req_status.offload_spans:
+            return []
+        spans = req_status.offload_spans
+        req_status.offload_spans = []
+        return spans
+
     def _sliding_window_lookup(
         self,
         keys: Sequence[OffloadKey],
@@ -855,6 +912,9 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+        # Fresh discovery for this lookup cursor; avoids carrying deferred runs
+        # from a prior call when this one early-returns with no spans.
+        req_status.offload_spans = []
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
         # in the current convergence iteration. Reset when a non-eagle group
@@ -916,7 +976,16 @@ class OffloadingConnectorScheduler:
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
-                if sliding_window_size_in_chunks is None:
+                later_spans: list[tuple[int, int]] = []
+                use_spans = (
+                    sliding_window_size_in_chunks is None
+                    and getattr(self.manager, "supports_disjoint_spans", False)
+                )
+                if use_spans:
+                    num_hit_chunks, later_spans = self._span_lookup(
+                        offload_keys, req_status.req_context
+                    )
+                elif sliding_window_size_in_chunks is None:
                     num_hit_chunks = self._maximal_prefix_lookup(
                         offload_keys,
                         req_status.req_context,
@@ -942,11 +1011,26 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                         initial_window + int(is_eagle_unverified),
                     )
-                if num_hit_chunks == 0:
+                if num_hit_chunks == 0 and not later_spans:
                     return 0
+                # Replace (do not append): _lookup may re-enter the group loop,
+                # and the scheduler may retry get_num_new_matched_tokens while
+                # the request is still waiting. Appending would duplicate the
+                # same deferred runs and inflate CPU hit counts.
+                req_status.offload_spans = [
+                    (
+                        (start_chunk_idx + start) * tokens_per_chunk,
+                        (start_chunk_idx + end) * tokens_per_chunk,
+                    )
+                    for start, end in later_spans
+                ]
 
                 if num_hit_chunks is None:
                     defer_lookup = True
+                elif num_hit_chunks == 0:
+                    # A hole sits in front of a later CPU run. The contiguous
+                    # external count stays 0; the spans were recorded above.
+                    max_hit_size_tokens = num_computed_tokens
                 else:
                     if is_eagle_unverified:
                         num_hit_chunks -= 1

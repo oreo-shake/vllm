@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from typing_extensions import override
 
@@ -65,6 +66,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        policy_kwargs: Mapping[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -77,7 +79,12 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        # LRU and ARC take only the capacity. Tier sizes are not forwarded,
+        # so their eviction order stays the one those classes implement.
+        if cache_policy in ("lru", "arc"):
+            self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        else:
+            self._policy = policy_cls(num_chunks, **dict(policy_kwargs or {}))
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -188,6 +195,9 @@ class CPUOffloadingManager(OffloadingManager):
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._get_request_cache_access(req_context)
+        on_new = getattr(self._policy, "on_new_request", None)
+        if on_new is not None:
+            on_new(req_context)
         return RequestOffloadingContext()
 
     @override
@@ -198,6 +208,20 @@ class CPUOffloadingManager(OffloadingManager):
         if not chunk.is_ready:
             return LookupResult.HIT_PENDING
         return LookupResult.HIT
+
+    @property
+    def supports_disjoint_spans(self) -> bool:
+        return self._policy.supports_disjoint_spans
+
+    @property
+    def refreshes_recency_from_connector(self) -> bool:
+        return self._policy.refreshes_recency_from_connector
+
+    def attach_session_tracker(self, tracker: object) -> None:
+        """Share the GPU idle-gap record. LRU and ARC ignore it."""
+        hook = getattr(self._policy, "attach_session_tracker", None)
+        if hook is not None:
+            hook(tracker)
 
     @override
     def get_load_source(
@@ -354,6 +378,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, chunk in zip(keys_to_store, chunks):
             self._policy.insert(key, chunk)
+        self._policy.note_stored(keys_to_store, req_context)
         self._num_write_pending_chunks += len(keys_to_store)
         state.inserted_keys.update(keys_to_store)
 
