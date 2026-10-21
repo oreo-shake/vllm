@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     ConfigInfoMapping,
     LoadStoreSpec,
@@ -99,6 +100,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_write_pending_chunks: int = 0
         # Lifetime count of chunks removed to make room for new stores.
         self._total_blocks_evicted: int = 0
+        # Start the interval after init so the first line is not an immediate 0.
         self._last_eviction_log_time: float = time.monotonic()
 
         self.store_threshold: int = store_threshold
