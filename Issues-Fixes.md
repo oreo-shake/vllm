@@ -1,5 +1,3 @@
-> Port note (feat/suffix-eviction-on-main): Upstream already includes `finished_signaled` (#49671) and abort/EOS `num_tokens_after_batch` (#49285). This document still describes the original 0.26-fork diagnosis; prefer upstream behavior for those lifecycle fixes and keep the span/lookup fixes below.
-
 # Issues and Fixes: prefix-pruning CPU offload lookup / recompute
 
 ## Context
@@ -275,3 +273,76 @@ no “log once” flag):
   admission, not once per failed waiting probe.
 - Deferred values must not jump by exact multiples across retries for the
   same request.
+
+**Follow-up:** Step 3's blanket discard-on-match caused Issue 5 (cold TTFT
+on deferred reload). Counting semantics here stay; load-path miss handling
+is corrected in Issue 5.
+
+---
+
+## Issue 5 — Deferred span load abandoned after hole-store eviction
+
+### Symptom
+
+Controlled 50GB CPU experiment (`prefix_pruning_on_sessions`, two prompts
+~256k/257k, GPU prefix reset, resend):
+
+```text
+# Before Issue 4 (good — both warm)
+req-0 r2_ttft ~3437ms   (-77.6%)
+req-1 r2_ttft ~3234ms   (-79.0%)
+
+# After Issue 4 discard-on-match (req0 cold)
+req-0 r2_ttft ~15482ms  (+4.8% / ~cold)
+req-1 r2_ttft ~2967ms   (-79.9%)
+```
+
+Round-2 hit log still showed `CPU=192256 (contiguous=0 deferred=192256)` for
+req0, but `kv_offload_load_bytes` equalled **only req1's** deferred size
+(`176640 × bytes_per_token`). Req0's deferred run was never H2D-loaded.
+
+### Root cause
+
+1. Deferred keys were **not pinned** while the front hole was recomputed and
+   stored. Prefix pruning peels earliest remaining tiers first, so storing
+   the hole could evict the **start** of the planned deferred run
+   (eviction `+249` blocks ≈ hole size during req0).
+
+2. Issue 4 made `_match_offload_span` **always discard** rediscovery, then on
+   `ext_tokens == 0` **`spans.pop(0)`**. After the punched head miss, later
+   still-resident runs rediscovered by the connector were thrown away and the
+   plan was emptied → full recompute → cold TTFT.
+
+The pre-Issue-4 `extend` path accidentally **refreshed** the plan after
+eviction (pop stale head, keep rediscovered suffix), which is why both
+reload TTFTs were warm despite the double-count bug on the waiting path.
+
+### Fix
+
+1. **Scheduler `_match_offload_span`**:
+   - `ext_tokens > 0`: discard rediscovery; trim plan (no double ingest).
+   - `ext_tokens == 0`: **replace** `_offload_spans` with rediscovered runs
+     (assign, never extend). Empty rediscovery clears the plan.
+
+2. **Pin deferred keys only after admit** (not on waiting probes):
+   - Waiting path **records** `_offload_spans` without pinning — GPU-full
+     retries must not hold CPU capacity or stores can deadlock.
+   - After successful `allocate_slots`, `_pin_offload_spans_after_admit`
+     freezes the hole/deferred split on CPU (`pin_deferred` /
+     `mark_non_evictable`) so hole-store eviction cannot chase a moving
+     span tail.
+   - Subsequent plan trim/replace/clear syncs pins only if already pinned.
+   - Unpin on request cleanup / cache reset.
+
+3. **Tests**: keep discard-on-success; add replace-on-miss and clear-on-empty
+   rediscovery cases in `test_offload_span_scheduling.py`.
+
+### Verification
+
+- Re-run `prefix_cache_ttft_compare.py` with sizes `256000 257000` against a
+  `prefix_pruning_on_sessions` server at ~50GB CPU: **both** round-2 TTFTs
+  should drop ~75–80% (not only req1).
+- Round-2 `kv_offload_load_bytes` should cover **both** requests' loaded
+  deferred/contiguous tokens (not req1 alone).
+- `concurrency=48/lru-sessions` must still pass Issue 4 (no double-count
+  assert / no multi-hit-log spam).

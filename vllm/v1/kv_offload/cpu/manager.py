@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from typing_extensions import override
+
+from vllm.logger import init_logger
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -31,6 +34,11 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+logger = init_logger(__name__)
+
+# How often to emit the cumulative CPU eviction count.
+_EVICTION_LOG_INTERVAL_S = 10.0
 
 
 @dataclass(slots=True)
@@ -89,6 +97,9 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
+        # Lifetime count of chunks removed to make room for new stores.
+        self._total_blocks_evicted: int = 0
+        self._last_eviction_log_time: float = time.monotonic()
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -223,6 +234,39 @@ class CPUOffloadingManager(OffloadingManager):
         if hook is not None:
             hook(tracker)
 
+    def pin_deferred(
+        self, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        """Hold ready chunks so hole-store eviction cannot drop deferred spans.
+
+        Same ref_cnt / mark_non_evictable accounting as ``prepare_load``, but
+        without building a load spec. Returns the keys that were actually
+        pinned (missing or not-ready keys are skipped).
+        """
+        pinned: list[OffloadKey] = []
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None or not chunk.is_ready:
+                continue
+            if chunk.ref_cnt == 0:
+                self._policy.mark_non_evictable(key)
+                self._num_evictable_cache_chunks -= 1  # ref_cnt 0 -> 1
+                assert self._num_evictable_cache_chunks >= 0
+            chunk.ref_cnt += 1
+            pinned.append(key)
+        return pinned
+
+    def unpin_deferred(self, keys: Collection[OffloadKey]) -> None:
+        """Release pins from ``pin_deferred``. Tolerates already-evicted keys."""
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None or chunk.ref_cnt <= 0:
+                continue
+            chunk.ref_cnt -= 1
+            if chunk.ref_cnt == 0:
+                self._num_evictable_cache_chunks += 1  # ref_cnt 1 -> 0
+                self._policy.mark_evictable(key)
+
     @override
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
@@ -258,6 +302,13 @@ class CPUOffloadingManager(OffloadingManager):
         if record_access:
             self._record_request_cache_access(keys, req_context, reused_keys=keys)
         return self._get_load_store_spec(keys, chunks)
+
+    def note_finished_keys(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        note = getattr(self._policy, "note_finished_keys", None)
+        if note is not None:
+            note(keys, req_context)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -357,6 +408,7 @@ class CPUOffloadingManager(OffloadingManager):
             # cache-policy removes only idle chunks.
             self._num_evictable_cache_chunks -= len(evicted)
             assert self._num_evictable_cache_chunks >= 0
+            self._total_blocks_evicted += len(evicted)
 
             for key, chunk in evicted:
                 self._free_chunk(chunk)
@@ -515,4 +567,17 @@ class CPUOffloadingManager(OffloadingManager):
             )
             self.stores_skipped_in_current_batch = 0
 
+        self._maybe_log_eviction_total()
+
         return stats
+
+    def _maybe_log_eviction_total(self) -> None:
+        """Emit the lifetime CPU eviction count at most every 10 seconds."""
+        now = time.monotonic()
+        if now - self._last_eviction_log_time < _EVICTION_LOG_INTERVAL_S:
+            return
+        self._last_eviction_log_time = now
+        logger.info(
+            "CPU tier blocks evicted until now: %d",
+            self._total_blocks_evicted,
+        )

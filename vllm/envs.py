@@ -331,6 +331,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_ENABLE_HPC_OPS: bool = False
     VLLM_REQUEST_BODY_LOG_LEVEL: str = "DEBUG"
+    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
     VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
     VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
@@ -2294,6 +2295,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recomputing only the missing blocks. Requires prefix caching, a single
     # full-attention KV cache group, no KV connector and no speculative
     # decoding.
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
+        int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
+        if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
+        else None
+    ),
     "VLLM_SUFFIX_PRESERVING_EVICTION": lambda: bool(
         int(os.getenv("VLLM_SUFFIX_PRESERVING_EVICTION", "0"))
     ),

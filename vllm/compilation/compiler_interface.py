@@ -26,6 +26,29 @@ logger = init_logger(__name__)
 _last_inductor_triton_cache_dir: str | None = None
 
 
+def _is_torch_default_triton_cache_dir(triton_cache: str) -> bool:
+    """True if TRITON_CACHE_DIR looks like a torchinductor default pin.
+
+    Torch may set TRITON_CACHE_DIR to ``{TORCHINDUCTOR_CACHE_DIR}/triton/{dev}``
+    during an early compile (import-time default under ``/tmp/torchinductor_*``,
+    or MM-encoder/CuteDSL warmup). That is not a user override and must not
+    win over the model-local cache under ``base_cache_dir``.
+    """
+    normalized = os.path.abspath(triton_cache)
+    inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if inductor and normalized.startswith(
+        os.path.join(os.path.abspath(inductor), "triton")
+    ):
+        return True
+    # Default torchinductor root is ``{tmpdir}/torchinductor_{user}``.
+    return "/torchinductor_" in normalized.replace("\\", "/")
+
+
+def _is_mega_aot_triton_cache_dir(triton_cache: str) -> bool:
+    """True if TRITON_CACHE_DIR sits under torch_aot_compile/{hash}/."""
+    return "torch_aot_compile" in os.path.abspath(triton_cache).replace("\\", "/")
+
+
 def initialize_inductor_cache(base_cache_dir: str) -> None:
     global _last_inductor_triton_cache_dir
     # Keep artifacts together unless the caller supplies a Triton cache.
@@ -33,9 +56,21 @@ def initialize_inductor_cache(base_cache_dir: str) -> None:
     os.makedirs(inductor_cache, exist_ok=True)
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
     triton_cache = os.environ.get("TRITON_CACHE_DIR")
+    # Mega-AOT sets TRITON under torch_aot_compile/{hash}/ before piecewise
+    # backends initialize. Keep that root so static-autotuner cubins stay next
+    # to the AOT artifact and warm reload resolves the same paths.
+    if triton_cache is not None and _is_mega_aot_triton_cache_dir(triton_cache):
+        os.makedirs(triton_cache, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = triton_cache
+        return
     # A directory assigned by an earlier adaptor is still a model-local
-    # default, rather than a caller override for subsequent models.
-    if triton_cache is None or triton_cache == _last_inductor_triton_cache_dir:
+    # default, rather than a caller override for subsequent models. Torch
+    # default pins under /tmp/torchinductor_* are also not caller overrides.
+    if (
+        triton_cache is None
+        or triton_cache == _last_inductor_triton_cache_dir
+        or _is_torch_default_triton_cache_dir(triton_cache)
+    ):
         triton_cache = os.path.join(base_cache_dir, "triton_cache")
         _last_inductor_triton_cache_dir = triton_cache
     os.makedirs(triton_cache, exist_ok=True)
@@ -289,7 +324,11 @@ class InductorStandaloneAdaptor(CompilerInterface):
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ) -> None:
         self.cache_dir = cache_dir
-        if not self.use_aot_compile and not disable_cache:
+        if not disable_cache:
+            # Always pin Inductor/Triton under this cache dir, including AOT.
+            # Skipping this for use_aot_compile left TORCHINDUCTOR at the /tmp
+            # default so static-autotuner cubins were written there while AOT
+            # reload resolved them under the vLLM cache tree.
             initialize_inductor_cache(
                 cache_dir[: -len(prefix)] if prefix else cache_dir
             )
