@@ -254,13 +254,14 @@ def test_session_lru_tail_matches_cpu_lru():
     assert evicted[0][0] == old_tail
 
 
-def test_first_request_pin_evicts_unpinned_blocks_like_lru():
+def test_first_request_pin_evicts_unpinned_blocks_by_lru_tail():
+    # With no recorded positions both blocks fall to the LRU tail, where the
+    # tier policy still breaks ties by recency rank (oldest tail first).
     policy = FirstRequestPinCachePolicy(8, session_ttl_s=10)
     policy._time_fn = lambda: 0.0
     head, tail = _key(b"head"), _key(b"tail")
     _ready(policy, head, 0)
     _ready(policy, tail, 1)
-    # Completion order would free the head. LRU frees the tail.
     policy.touch([head, tail], ReqContext(req_id="r"))
     policy.mark_evictable(tail)
     policy.mark_evictable(head)
@@ -268,6 +269,71 @@ def test_first_request_pin_evicts_unpinned_blocks_like_lru():
     assert evicted is not None
     assert evicted[0][0] == tail
     assert policy.get(head) is not None
+
+
+def test_first_request_pin_peels_unpinned_prefix_tiers():
+    # Non-pinned sessions must follow the prefix-tier peel so a reused suffix
+    # survives and the connector can report a disjoint span.
+    policy = FirstRequestPinCachePolicy(
+        8, first_tier_tokens=1, tier_step_tokens=1, max_tiers=4, session_ttl_s=10
+    )
+    policy._time_fn = lambda: 0.0
+    shallow, deep = _key(b"shallow"), _key(b"deep")
+    shallow_block, deep_block = ChunkStatus(0), ChunkStatus(1)
+    shallow_block.ref_cnt = 0
+    deep_block.ref_cnt = 0
+    policy.insert(shallow, shallow_block)
+    policy.insert(deep, deep_block)
+    ctx = ReqContext(
+        req_id="r1",
+        session_id="s1",
+        priority=1,  # not the pinned priority-0 session
+        token_positions={shallow: 0, deep: 100},
+    )
+    policy.touch([shallow, deep], ctx)
+    evicted = policy.evict(1, set())
+    assert evicted is not None
+    assert evicted[0][0] == shallow
+    assert policy.get(deep) is not None
+    # The surviving suffix shows up as a disjoint span across the hole.
+    assert policy.cached_spans([shallow, deep]) == [(1, 2)]
+
+
+def test_first_request_pin_holds_stem_while_peeling_rest():
+    # The pinned priority-0 stem is protected even though its position is the
+    # shallowest tier; the rest of the session still peels prefix-first.
+    policy = FirstRequestPinCachePolicy(
+        8, first_tier_tokens=1, tier_step_tokens=1, max_tiers=4, session_ttl_s=10
+    )
+    policy._time_fn = lambda: policy._now
+    policy._now = 0.0
+    stem, mid = _key(b"stem"), _key(b"mid")
+    stem_block, mid_block = ChunkStatus(0), ChunkStatus(1)
+    stem_block.ref_cnt = 0
+    mid_block.ref_cnt = 0
+    ctx = ReqContext(
+        req_id="r0",
+        session_id="s0",
+        priority=0,
+        block_hashes=(b"stem",),
+        token_positions={stem: 0, mid: 100},
+    )
+    policy.on_new_request(ctx)
+    policy.insert(stem, stem_block)
+    policy.insert(mid, mid_block)
+    policy.note_stored([stem, mid], ctx)
+    policy._now = 0.1
+    policy.notify_request_finished(ctx)
+    # While held, the shallow stem survives and the deeper block is the victim.
+    evicted = policy.evict(1, set())
+    assert evicted is not None
+    assert evicted[0][0] == mid
+    assert policy.get(stem) is not None
+    # After the TTL the stem is an ordinary tier victim again.
+    policy._now = 11.0
+    evicted = policy.evict(1, set())
+    assert evicted is not None
+    assert evicted[0][0] == stem
 
 
 def test_prefix_spans_skip_a_hole():

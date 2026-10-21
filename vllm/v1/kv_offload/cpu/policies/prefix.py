@@ -27,7 +27,6 @@ from vllm.v1.kv_offload.cpu.policies.base import (
     ChunkStatus,
     order_request_keys,
 )
-from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
 UNKNOWN_POSITION = 1 << 30
 
@@ -332,33 +331,43 @@ class PrefixPruningOnSessionsCachePolicy(PrefixPruningCachePolicy):
         self._tracker = SessionLivenessTracker(observe_idle=True)
 
 
-class FirstRequestPinCachePolicy(LRUCachePolicy):
-    """LRU order, except a priority-0 first request that has reached CPU.
+class FirstRequestPinCachePolicy(PrefixPruningCachePolicy):
+    """Prefix tiers, plus a hold on a priority-0 session's first request.
 
-    Blocks still on GPU are not pinned here. A hash is protected only after
-    it is stored. Protection lasts until the session has been idle for the
-    CPU session TTL. Priority 1 and above are ordinary LRU victims.
+    Non-pinned blocks follow the same position-tier peel as ``prefix_pruning``
+    (shallow prefix tiers are evicted before the LRU tail), so reuse keeps the
+    deep suffix cached and the connector reports the surviving run as a
+    disjoint span. On top of that peel, the first request of a priority-0
+    session is protected from eviction until the session has been idle for the
+    CPU session TTL. Blocks still on GPU are not pinned here; a hash is
+    protected only after it is stored. A missing ``priority`` is 0; priority 1
+    and above are ordinary tier victims.
     """
 
-    # Pin tracking uses touch. Do not inherit LRU's opt-out.
-    refreshes_recency_from_connector = True
     supports_disjoint_spans = True
 
     def __init__(
         self,
         cache_capacity: int,
+        first_tier_tokens: int = 16384,
+        tier_step_tokens: int = 16384,
+        max_tiers: int = 8,
         session_ttl_s: float | None = None,
         **kwargs: object,
     ) -> None:
-        super().__init__(cache_capacity)
+        super().__init__(
+            cache_capacity,
+            first_tier_tokens=first_tier_tokens,
+            tier_step_tokens=tier_step_tokens,
+            max_tiers=max_tiers,
+        )
         del kwargs
         self._ttl_floor = (
             resolve_cpu_session_ttl_s() if session_ttl_s is None else session_ttl_s
         )
         self._ttl_scale = envs.VLLM_CPU_SESSION_TTL_K
+        # Pin needs its own idle tracker unless a shared GPU tracker is attached.
         self._tracker = SessionLivenessTracker(observe_idle=True)
-        self._shared_tracker: SessionLivenessTracker | None = None
-        self._time_fn = time.monotonic
         self._first_hashes: dict[str, set[bytes]] = {}
         self._key_session: dict[OffloadKey, str] = {}
 
@@ -366,8 +375,7 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
         session_id = _session_id(req_context)
         if not session_id or _priority(req_context) != 0:
             return
-        current = self._first_hashes.get(session_id)
-        if current:
+        if self._first_hashes.get(session_id):
             return
         raw: set[bytes] = set()
         for item in req_context.block_hashes:
@@ -378,7 +386,7 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
                     raw.add(bytes(item))
                 except TypeError:
                     continue
-        if raw or current is None:
+        if raw or session_id not in self._first_hashes:
             self._first_hashes[session_id] = raw
 
     def _bind(self, key: OffloadKey, req_context: ReqContext) -> None:
@@ -391,6 +399,7 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
 
     @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+        keys = list(keys)
         super().touch(keys, req_context)
         for key in keys:
             self._bind(key, req_context)
@@ -399,6 +408,8 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
     def note_stored(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
     ) -> None:
+        keys = list(keys)
+        super().note_stored(keys, req_context)
         for key in keys:
             self._bind(key, req_context)
 
@@ -407,9 +418,10 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
         super().remove(key)
         self._key_session.pop(key, None)
 
+    @override
     def on_new_request(self, req_context: ReqContext) -> None:
         self._remember_first(req_context)
-        if self._shared_tracker is not None:
+        if self._shared_tracker is not None or self._tracker is None:
             return
         self._tracker.on_arrival(
             _session_id(req_context),
@@ -418,32 +430,13 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
             first_request_hashes=tuple(req_context.block_hashes),
         )
 
-    def notify_request_finished(self, req_context: ReqContext) -> None:
-        if self._shared_tracker is not None:
-            return
-        self._tracker.on_finish(_session_id(req_context), self._time_fn())
-
-    @override
-    def on_request_finished(
-        self,
-        key_groups: Sequence[Sequence[OffloadKey]],
-        insertion_only_keys: set[OffloadKey],
-        reused_keys: set[OffloadKey],
-        req_context: ReqContext,
-    ) -> None:
-        super().on_request_finished(
-            key_groups, insertion_only_keys, reused_keys, req_context
-        )
-        self.notify_request_finished(req_context)
-
-    def attach_session_tracker(self, tracker: SessionLivenessTracker) -> None:
-        self._shared_tracker = tracker
-
     def _held(self, key: OffloadKey, now: float) -> bool:
         session_id = self._key_session.get(key)
         if not session_id:
             return False
-        tracker = self._shared_tracker or self._tracker
+        tracker = self._active_tracker()
+        if tracker is None:
+            return False
         return not tracker.idle_expired(
             session_id, now, self._ttl_scale, self._ttl_floor
         )
@@ -455,26 +448,33 @@ class FirstRequestPinCachePolicy(LRUCachePolicy):
         if n == 0:
             return []
         now = self._time_fn()
-        # Unpinned blocks follow CPU LRU rank.
-        ranked = sorted(
-            (
-                key
-                for key in self._evictable
-                if key not in protected and not self._held(key, now)
-            ),
-            key=self._ranks.__getitem__,
-        )
-        if len(ranked) < n:
+        dead = self._dead_sessions()
+        candidates = []
+        for key in self._evictable - protected:
+            # A pinned first-request block is held out of the peel until its
+            # session goes idle. Everything else is scored by position tier,
+            # so shallow prefixes go before the deep suffix (leaving a hole
+            # the connector reloads as a disjoint span).
+            if self._held(key, now):
+                continue
+            session_id = self._sessions.get(key)
+            candidates.append(
+                self._scorer.score(
+                    self._positions.get(key, UNKNOWN_POSITION),
+                    self._ranks.get(key, 0),
+                    key,
+                    session_id is not None and session_id in dead,
+                )
+            )
+        if len(candidates) < n:
             return None
-        candidates: list[tuple[OffloadKey, ChunkStatus]] = []
-        for key in ranked[:n]:
-            chunk = self.chunks[key]
-            candidates.append((key, chunk))
-            self._evictable.remove(key)
-            del self.chunks[key]
-            self._ranks.pop(key, None)
+        evicted = []
+        for *_, key in heapq.nsmallest(n, candidates):
+            chunk = self.chunks.pop(key)
+            self._forget(key)
             self._key_session.pop(key, None)
-        return candidates
+            evicted.append((key, chunk))
+        return evicted
 
     @override
     def clear(self) -> None:
