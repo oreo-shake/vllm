@@ -400,6 +400,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "if the served model does not use priority scheduling."
         ),
     )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Conversation / agent-run identity. Wins over the X-Session-ID "
+            "header. Used by session-aware suffix eviction."
+        ),
+    )
     request_id: str = Field(
         default_factory=random_uuid,
         description=(
@@ -759,6 +766,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             prompt_logprobs = self.top_logprobs
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        if self.session_id:
+            extra_args["session_id"] = self.session_id
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

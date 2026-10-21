@@ -8,6 +8,8 @@ from typing import Any
 
 from typing_extensions import override
 
+from vllm.logger import init_logger
+
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
@@ -234,6 +236,39 @@ class CPUOffloadingManager(OffloadingManager):
         if hook is not None:
             hook(tracker)
 
+    def pin_deferred(
+        self, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        """Hold ready chunks so hole-store eviction cannot drop deferred spans.
+
+        Same ref_cnt / mark_non_evictable accounting as ``prepare_load``, but
+        without building a load spec. Returns the keys that were actually
+        pinned (missing or not-ready keys are skipped).
+        """
+        pinned: list[OffloadKey] = []
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None or not chunk.is_ready:
+                continue
+            if chunk.ref_cnt == 0:
+                self._policy.mark_non_evictable(key)
+                self._num_evictable_cache_chunks -= 1  # ref_cnt 0 -> 1
+                assert self._num_evictable_cache_chunks >= 0
+            chunk.ref_cnt += 1
+            pinned.append(key)
+        return pinned
+
+    def unpin_deferred(self, keys: Collection[OffloadKey]) -> None:
+        """Release pins from ``pin_deferred``. Tolerates already-evicted keys."""
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None or chunk.ref_cnt <= 0:
+                continue
+            chunk.ref_cnt -= 1
+            if chunk.ref_cnt == 0:
+                self._num_evictable_cache_chunks += 1  # ref_cnt 1 -> 0
+                self._policy.mark_evictable(key)
+
     @override
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
@@ -269,6 +304,13 @@ class CPUOffloadingManager(OffloadingManager):
         if record_access:
             self._record_request_cache_access(keys, req_context, reused_keys=keys)
         return self._get_load_store_spec(keys, chunks)
+
+    def note_finished_keys(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        note = getattr(self._policy, "note_finished_keys", None)
+        if note is not None:
+            note(keys, req_context)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:

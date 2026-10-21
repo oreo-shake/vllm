@@ -580,13 +580,17 @@ def _support_torch_compile(
 
             # Hash-level dir; shared across ranks on the same node.
             self.compilation_config.local_cache_dir = cache_dir
-            inductor_cache = os.path.join(cache_dir, "inductor_cache")
-            os.makedirs(inductor_cache, exist_ok=True)
             # Process-wide: post-load execution, CUDA-graph capture, and later
-            # autotune/recompile all need to write under {hash}/inductor_cache/.
-            # Unconditional because torch's cache_dir() may have pre-filled the
-            # /tmp default during import, making setdefault a no-op.
-            os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+            # autotune/recompile all need Inductor/Triton under this AOT hash.
+            # initialize_inductor_cache overwrites a /tmp/torchinductor_$USER
+            # pin from torch import and replaces torch-default TRITON_CACHE_DIR
+            # pins (e.g. from MM-encoder/CuteDSL warmup) so static-autotuner
+            # cubins emit and reload under the same tree.
+            from vllm.compilation.compiler_interface import (
+                initialize_inductor_cache,
+            )
+
+            initialize_inductor_cache(cache_dir)
 
             rank = self.vllm_config.parallel_config.rank
             dp_rank = self.vllm_config.parallel_config.data_parallel_index

@@ -93,6 +93,13 @@ class LRUCachePolicy(CachePolicy):
         self._evictable.discard(key)
 
     @override
+    def note_finished_keys(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Record LRU order once at request finish (not on every connector touch)."""
+        del req_context
+        self._update_recency(reversed(list(keys)))
+
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         self._update_recency(reversed(list(keys)))
 

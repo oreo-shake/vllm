@@ -25,7 +25,6 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.policies.base import (
     CachePolicy,
     ChunkStatus,
-    order_request_keys,
 )
 
 UNKNOWN_POSITION = 1 << 30
@@ -93,15 +92,14 @@ def _priority(req_context: ReqContext) -> int:
     return req_context.priority
 
 
-def _position(key: OffloadKey, req_context: ReqContext) -> int | None:
-    if req_context.token_positions is not None and key in req_context.token_positions:
-        return req_context.token_positions[key]
-    return req_context.get_offload_key_position(key)
 
 
 class PrefixPruningCachePolicy(CachePolicy):
     """Peel shallow CPU tiers before the LRU tail. No session identity."""
 
+    # Connector touch supplies start-token positions and refreshes LRU order.
+    # Matches the older prefix_pruning / prefix_pruning_on_sessions contract.
+    refreshes_recency_from_connector = True
     supports_disjoint_spans = True
 
     def __init__(
@@ -128,9 +126,13 @@ class PrefixPruningCachePolicy(CachePolicy):
         self._time_fn = time.monotonic
 
     def _note_position(self, key: OffloadKey, req_context: ReqContext) -> None:
-        position = _position(key, req_context)
-        if position is not None:
-            self._positions[key] = position
+        # Tier peel uses start-token positions from connector touch
+        # (index * tokens_per_chunk). Do not fall back to end-token
+        # get_offload_key_position — that can push the chunk at a tier
+        # boundary into a deeper tier and change eviction order.
+        positions = req_context.token_positions
+        if positions is not None and key in positions:
+            self._positions[key] = positions[key]
 
     def _note_session(self, key: OffloadKey, session_id: str | None) -> None:
         if not session_id:
@@ -192,11 +194,21 @@ class PrefixPruningCachePolicy(CachePolicy):
         self._refresh_lru_order(present)
 
     @override
+    def note_finished_keys(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        # Used when refreshes_recency_from_connector is false. Prefix policies
+        # keep refreshes true so connector touch owns mid-request order; this
+        # remains for API parity with the older branch.
+        del req_context
+        self._refresh_lru_order(keys)
+
     def note_stored(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
     ) -> None:
-        # Store path also records position/session even if connector touch
-        # has not run yet (or runs only on lookup).
+        # Bind session (and start-token position when touch already filled
+        # token_positions) on the store path. Tier positions still come from
+        # connector touch — same as the older branch.
         session_id = _session_id(req_context)
         for key in keys:
             if key not in self.chunks:
@@ -212,8 +224,10 @@ class PrefixPruningCachePolicy(CachePolicy):
         reused_keys: set[OffloadKey],
         req_context: ReqContext,
     ) -> None:
-        del insertion_only_keys, reused_keys
-        self._refresh_lru_order(order_request_keys(key_groups, req_context))
+        # Newer manager passes key groups; prefix policies ignore them for
+        # recency. Connector touch already refreshed LRU (older behavior).
+        # Only update the session liveness tracker here.
+        del key_groups, insertion_only_keys, reused_keys
         self.notify_request_finished(req_context)
 
     def attach_session_tracker(self, tracker: SessionLivenessTracker) -> None:
