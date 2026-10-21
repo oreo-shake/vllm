@@ -1058,10 +1058,14 @@ class Scheduler(SchedulerInterface):
                 did_prefix_cache_lookup = False
                 suffix_hit = None
                 num_suffix_hit_tokens = 0
+                deferred_span_tokens = 0
                 cpu_hit_tokens = 0
+                # True for the initial GPU/CPU tier lookup. Span-load retries
+                # use num_computed_tokens > 0 and must not re-publish hits.
+                initial_kv_lookup = request.num_computed_tokens == 0
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if initial_kv_lookup:
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,
@@ -1208,18 +1212,6 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats and request.num_preemptions <= 0:
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=(
-                                num_new_local_computed_tokens + num_suffix_hit_tokens
-                            ),
-                            num_external_cached_tokens=cpu_hit_tokens
-                            if self.connector is not None
-                            else num_external_computed_tokens,
-                        )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
                     )
@@ -1446,6 +1438,36 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # Publish the initial tier-hit plan only when this request is
+                # actually admitted (slots allocated). Probing while GPU-full
+                # retries the waiting path with num_computed_tokens == 0; logging
+                # or recording stats there both pollutes and, before span
+                # replace semantics, could double-count deferred CPU runs.
+                if initial_kv_lookup:
+                    logger.info(
+                        "Request %s KV tier hits: GPU=%d CPU=%d "
+                        "(contiguous=%d deferred=%d)",
+                        request.request_id,
+                        num_new_local_computed_tokens,
+                        cpu_hit_tokens,
+                        num_external_computed_tokens,
+                        deferred_span_tokens,
+                    )
+                    # Track first scheduled prefill, not post-preemption repeats.
+                    if (
+                        request.prefill_stats is not None
+                        and request.num_preemptions <= 0
+                    ):
+                        assert num_computed_tokens <= request.num_prompt_tokens
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=num_new_local_computed_tokens
+                            + num_suffix_hit_tokens,
+                            num_external_cached_tokens=cpu_hit_tokens
+                            if self.connector is not None
+                            else num_external_computed_tokens,
+                        )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -3108,6 +3130,42 @@ class Scheduler(SchedulerInterface):
                 session_ttl_limit_s or "off",
                 session_ttl_k if session_ttl_limit_s else "off",
             )
+
+    def _enable_system_prompt_pin(self) -> None:
+        min_requests = envs.VLLM_PIN_MIN_REQUESTS
+        share = envs.VLLM_PIN_SHARE
+        drop = envs.VLLM_PIN_DROP
+        max_tokens = envs.VLLM_PIN_MAX_TOKENS
+        probe_tokens = envs.VLLM_PIN_PROBE_TOKENS
+        confirm = envs.VLLM_PIN_CONFIRM
+        window = envs.VLLM_PIN_WINDOW
+        max_clusters = envs.VLLM_PIN_MAX_CLUSTERS
+        if min_requests < 2:
+            raise ValueError("VLLM_PIN_MIN_REQUESTS must be >= 2")
+        if not 0.0 < share <= 1.0:
+            raise ValueError("VLLM_PIN_SHARE must be in (0, 1]")
+        if not 0.0 < drop <= 1.0:
+            raise ValueError("VLLM_PIN_DROP must be in (0, 1]")
+        if max_tokens < 1:
+            raise ValueError("VLLM_PIN_MAX_TOKENS must be >= 1")
+        if probe_tokens < 1:
+            raise ValueError("VLLM_PIN_PROBE_TOKENS must be >= 1")
+        if confirm < 1:
+            raise ValueError("VLLM_PIN_CONFIRM must be >= 1")
+        if window < min_requests:
+            raise ValueError("VLLM_PIN_WINDOW must be >= VLLM_PIN_MIN_REQUESTS")
+        if max_clusters < 1:
+            raise ValueError("VLLM_PIN_MAX_CLUSTERS must be >= 1")
+        self.kv_cache_manager.enable_system_prompt_pin(
+            min_requests=min_requests,
+            share=share,
+            drop=drop,
+            max_pin_tokens=max_tokens,
+            probe_tokens=probe_tokens,
+            confirm=confirm,
+            window=window,
+            max_clusters=max_clusters,
+        )
 
     def _cpu_policy_needs_idle_average(self) -> bool:
         """True when the CPU tier is not LRU or ARC.
