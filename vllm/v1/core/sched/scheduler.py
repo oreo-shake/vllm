@@ -1166,28 +1166,18 @@ class Scheduler(SchedulerInterface):
                             spans = take_spans(request)
                             # Record only: pinning waits until allocate_slots
                             # succeeds (see _pin_offload_spans_after_admit).
+                            # take_spans pops the connector copy — an empty
+                            # return on a GPU-full retry must not wipe a plan
+                            # already stored from the prior probe.
                             if isinstance(spans, (list, tuple)) and spans:
                                 self._record_offload_spans(request, list(spans))
-                            else:
+                            elif request.request_id not in self._offload_spans:
                                 self._record_offload_spans(request, None)
 
-                        # Contiguous external tokens load immediately.
-                        # Deferred span tokens are also CPU hits; they load
-                        # after the hole in front is recomputed. Count both
-                        # here so external hit rate stays consistent.
-                        deferred_span_tokens = self._pending_offload_span_tokens(
-                            request.request_id
-                        )
-                        cpu_hit_tokens = (
-                            num_external_computed_tokens + deferred_span_tokens
-                        )
-
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
-                        )
-                        connector_prefix_cache_hits = cpu_hit_tokens
-
                     # Total computed tokens (local + external).
+                    # Deferred spans are not part of num_computed yet; they
+                    # load after the hole. Hit accounting for metrics/logs
+                    # happens only after allocate_slots succeeds below.
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
@@ -1208,9 +1198,11 @@ class Scheduler(SchedulerInterface):
                         )
                         num_new_local_computed_tokens = 0
                         num_external_computed_tokens = 0
-                        connector_prefix_cache_hits = 0
                         num_computed_tokens = 0
                         load_kv_async = False
+                        # Discard any deferred CPU plan; admit-time hit
+                        # accounting must not credit those tokens.
+                        self._record_offload_spans(request, None)
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
@@ -1451,20 +1443,29 @@ class Scheduler(SchedulerInterface):
                 # many waiters hold CPU capacity while GPU stays full.
                 self._pin_offload_spans_after_admit(request)
 
-                # Publish the initial tier-hit plan only when this request is
-                # actually admitted (slots allocated). Probing while GPU-full
-                # retries the waiting path with num_computed_tokens == 0; logging
-                # or recording stats there both pollutes and, before span
-                # replace semantics, could double-count deferred CPU runs.
+                # Hit rate / tier-hit log: only after promote-to-running
+                # (allocate_slots + pin). Waiting probes must not contribute.
                 if initial_kv_lookup:
+                    deferred_spans = self._offload_spans.get(request.request_id, [])
+                    deferred_span_tokens = self._pending_offload_span_tokens(
+                        request.request_id
+                    )
+                    cpu_hit_tokens = (
+                        num_external_computed_tokens + deferred_span_tokens
+                    )
+                    connector_prefix_cache_queries = (
+                        request.num_tokens - num_new_local_computed_tokens
+                    )
+                    connector_prefix_cache_hits = cpu_hit_tokens
                     logger.info(
                         "Request %s KV tier hits: GPU=%d CPU=%d "
-                        "(contiguous=%d deferred=%d)",
+                        "(contiguous=%d deferred=%d spans=%s)",
                         request.request_id,
                         num_new_local_computed_tokens,
                         cpu_hit_tokens,
                         num_external_computed_tokens,
                         deferred_span_tokens,
+                        deferred_spans,
                     )
                     # Track first scheduled prefill, not post-preemption repeats.
                     if (
@@ -3466,6 +3467,15 @@ class Scheduler(SchedulerInterface):
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
+        elif (
+            reset_successful
+            and self.log_stats
+            and self.connector_prefix_cache_stats is not None
+        ):
+            # GPU-only reset keeps the CPU tier, but still opens a new
+            # external hit-rate window so cold queries from the previous
+            # round do not dilute warm-round External prefix cache hit rate.
+            self.connector_prefix_cache_stats.reset = True
 
         if reset_successful and self.aux_output_connector is not None:
             self.aux_output_connector.reset()

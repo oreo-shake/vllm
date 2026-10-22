@@ -905,13 +905,16 @@ class OffloadingConnectorScheduler:
     def sync_deferred_span_pins(
         self, request: Request, spans: Sequence[tuple[int, int]]
     ) -> None:
-        """Pin CPU keys for the scheduler's deferred plan; unpin the previous set.
+        """Touch + pin CPU keys for the scheduler's deferred plan.
 
         Called only after the scheduler has admitted the request
         (``allocate_slots`` succeeded). Pinning on waiting probes would hold
         CPU capacity while GPU-full retries cannot run the hole recompute,
         which can deadlock stores. Once pinned, hole-store eviction cannot
         punch the planned span head / chase a moving deferred tail.
+
+        Touch refreshes recency (and prefix-tier positions) for the planned
+        run at the same moment LRU would bump a contiguous hit before load.
         """
         req_status = self._req_status.get(request.request_id)
         if req_status is None:
@@ -927,6 +930,34 @@ class OffloadingConnectorScheduler:
             return
         req_status.update_offload_keys()
         keys = self._keys_for_spans(req_status, spans)
+        # Also pin any other ready CPU hits for this request. Undersized
+        # tiers can still hold a shallow margin outside the planned span;
+        # leaving those unpinned lets hole-store peel them (+evictions)
+        # even though the deferred run itself is protected.
+        seen = set(keys)
+        for group_state in req_status.group_states:
+            for key in group_state.offload_keys:
+                if key in seen:
+                    continue
+                if self.manager.lookup(key, req_status.req_context) == LookupResult.HIT:
+                    keys.append(key)
+                    seen.add(key)
+        if not keys:
+            return
+        # Recency + start-token positions for every key we are about to hold.
+        positions: dict[OffloadKey, int] = {}
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            for index, key in enumerate(group_state.offload_keys):
+                if key in seen:
+                    positions[key] = index * tokens_per_chunk
+        if req_status.req_context.token_positions is None:
+            req_status.req_context.token_positions = positions
+        else:
+            req_status.req_context.token_positions.update(positions)
+        self.manager.touch(keys, req_status.req_context)
         req_status.deferred_pin_keys = list(pin(keys))
 
     def _clear_deferred_span_pins(self, req_status: RequestOffloadState) -> None:

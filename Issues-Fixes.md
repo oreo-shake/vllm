@@ -280,6 +280,62 @@ is corrected in Issue 5.
 
 ---
 
+## Issue 6 — Admit-time deferred pin never reached the CPU manager
+
+### Symptom
+
+Warm replay with `prefix_pruning_on_sessions` under a tight CPU tier:
+stable-looking `CPU=… (contiguous=0 deferred=…)` logs, but every hole
+prefill step still did D2H (`store_bytes` / Memcpy DtoH), and lifetime
+CPU eviction kept climbing. A PyTorch trace showed
+`_pin_offload_spans_after_admit` / `_sync_offload_span_pins` running with
+**zero** `manager.pin_deferred` / `mark_non_evictable` calls until the
+later `prepare_load`.
+
+### Root cause
+
+The engine scheduler pins via
+`getattr(self.connector, "sync_deferred_span_pins", None)`. That method
+lived only on `OffloadingConnectorScheduler`. `OffloadingConnector`
+forwarded `take_offload_spans` but **not** `sync_deferred_span_pins`, so
+every admit-time pin was a silent no-op (`sync is None` → discard pinned
+flag). Hole-store eviction could chase the planned deferred suffix;
+logged deferred hits were discovery-time sums, not held capacity.
+
+### Fix
+
+- Forward `sync_deferred_span_pins` on `OffloadingConnector` (same pattern
+  as `take_offload_spans`).
+- On pin, also `touch` the deferred keys (recency + start-token positions).
+- Log planned spans in the KV tier hit line:
+  `spans=[(start, end), …]` beside `deferred=` (which is
+  `sum(end - start)` over `_offload_spans`).
+
+### Verification
+
+- `tests/v1/core/test_offload_span_scheduling.py::test_offloading_connector_forwards_sync_deferred_span_pins`
+- `tests/v1/kv_offload/cpu/test_manager.py::test_pin_deferred_blocks_hole_store_eviction`
+- Warm replay: hole `prepare_store` should fail or skip while the deferred
+  plan is pinned; eviction counter should not climb by ~hole size each
+  request; `prepare_load` pin count should match the planned deferred run.
+
+### Follow-up (same log after Issue 6)
+
+Pin worked (`cannot store chunks`, `allocation_failure=7`), but eviction still
+rose **358 → 398 (+40)**: capacity held ~40 resident chunks *outside* the
+planned span `[(101888, 256000)]`, and those stayed unpinned. Fix: pin every
+ready CPU hit for the request, not only `_keys_for_spans`.
+
+External hit rate **30.1%** was cold+warm cumulative
+(`154112/512000`): GPU-only `/reset_prefix_cache` never set
+`connector_prefix_cache_stats.reset` (only `reset_connector=true` did). Fix:
+flag the external hit-rate window on successful GPU reset as well (CPU tier
+unchanged). Also move hit accounting to after `allocate_slots` + pin, and do
+not wipe an existing deferred plan when `take_spans` returns empty on a
+GPU-full retry.
+
+---
+
 ## Issue 5 — Deferred span load abandoned after hole-store eviction
 
 ### Symptom

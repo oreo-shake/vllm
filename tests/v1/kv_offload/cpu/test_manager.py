@@ -1571,3 +1571,41 @@ def test_request_key_positions_order_tails_across_kv_groups():
     output = manager.prepare_store(to_keys([10, 11]), make_req_context("evict"))
     assert output is not None
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
+
+
+def test_pin_deferred_blocks_hole_store_eviction():
+    """Admit-time pin must keep a deferred suffix while a hole store needs space."""
+    manager = CPUOffloadingManager(
+        num_chunks=2,
+        cache_policy="prefix_pruning",
+        policy_kwargs={
+            "first_tier_tokens": 1,
+            "tier_step_tokens": 1,
+            "max_tiers": 4,
+        },
+    )
+    deep = make_offload_key(b"deep", 0)
+    mid = make_offload_key(b"mid", 0)
+    hole = make_offload_key(b"hole", 0)
+    ctx = ReqContext(
+        req_id="warm",
+        token_positions={deep: 100, mid: 50, hole: 0},
+    )
+    assert manager.prepare_store([deep, mid], ctx) is not None
+    manager.complete_store([deep, mid], ctx)
+    manager.touch([deep, mid], ctx)
+
+    # Entire resident deferred plan is pinned (single-request undersized CPU).
+    pinned = manager.pin_deferred([deep, mid])
+    assert set(pinned) == {deep, mid}
+
+    # Cache full and nothing evictable: hole store must fail, suffix stays.
+    assert manager.prepare_store([hole], ctx) is None
+    assert manager.lookup(deep, ctx) == LookupResult.HIT
+    assert manager.lookup(mid, ctx) == LookupResult.HIT
+
+    manager.unpin_deferred([deep, mid])
+    output = manager.prepare_store([hole], ctx)
+    assert output is not None
+    assert deep in output.evicted_keys or mid in output.evicted_keys
+    assert manager.lookup(hole, ctx) != LookupResult.MISS

@@ -167,6 +167,20 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return []
         return take(request)
 
+    def sync_deferred_span_pins(
+        self, request: "Request", spans: list[tuple[int, int]]
+    ) -> None:
+        """Pin (or unpin) CPU keys for the scheduler's deferred offload plan.
+
+        The engine scheduler calls this on the connector after admit. Without
+        this forward, ``getattr(connector, "sync_deferred_span_pins")`` is
+        None and deferred spans are never held against hole-store eviction.
+        """
+        assert self.connector_scheduler is not None
+        sync = getattr(self.connector_scheduler, "sync_deferred_span_pins", None)
+        if sync is not None:
+            sync(request, spans)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

@@ -206,3 +206,35 @@ def test_waiting_record_does_not_pin_before_admit():
     connector.sync_deferred_span_pins.assert_called_once_with(
         request, [(1024, 8192)]
     )
+
+
+def test_offloading_connector_forwards_sync_deferred_span_pins():
+    """Engine scheduler calls the connector; it must reach the offload scheduler."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    connector = object.__new__(OffloadingConnector)
+    connector.connector_scheduler = MagicMock()
+    request = _request("r0", num_computed_tokens=0)
+    spans = [(1024, 8192)]
+
+    connector.sync_deferred_span_pins(request, spans)
+
+    connector.connector_scheduler.sync_deferred_span_pins.assert_called_once_with(
+        request, spans
+    )
+
+
+def test_record_empty_spans_does_not_wipe_existing_plan_when_already_present():
+    """Simulate take_spans=[] on retry: keep the plan from the prior probe."""
+    req_id = "r0"
+    sched, _ = _scheduler_with_spans(req_id, [(1024, 8192)])
+    request = _request(req_id, num_computed_tokens=0)
+
+    # Mirrors the admit-path guard: only clear when no plan exists yet.
+    if req_id not in sched._offload_spans:
+        sched._record_offload_spans(request, None)
+
+    assert sched._offload_spans[req_id] == [(1024, 8192)]
+    assert sched._pending_offload_span_tokens(req_id) == 8192 - 1024
