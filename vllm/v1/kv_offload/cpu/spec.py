@@ -163,6 +163,15 @@ class CPUOffloadingSpec(OffloadingSpec):
                 for name in ("first_tier_tokens", "tier_step_tokens", "max_tiers")
                 if name in self.extra_config
             }
+            # Tokens covered by one offload chunk for eviction hit-analysis logs.
+            if self.tokens_per_block:
+                tokens_per_chunk = int(self.tokens_per_block[0]) * int(
+                    self.blocks_per_chunk
+                )
+            else:
+                tokens_per_chunk = int(self.extra_config.get("block_size", 0)) * int(
+                    self.blocks_per_chunk
+                )
             self._manager = CPUOffloadingManager(
                 num_chunks=self.num_chunks,
                 cache_policy=self.eviction_policy,
@@ -171,6 +180,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
                 policy_kwargs=policy_kwargs or None,
+                tokens_per_chunk=tokens_per_chunk,
             )
         return self._manager
 

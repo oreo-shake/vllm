@@ -76,6 +76,7 @@ class CPUOffloadingManager(OffloadingManager):
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
         policy_kwargs: Mapping[str, Any] | None = None,
+        tokens_per_chunk: int = 0,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -102,6 +103,9 @@ class CPUOffloadingManager(OffloadingManager):
         self._total_blocks_evicted: int = 0
         # Start the interval after init so the first line is not an immediate 0.
         self._last_eviction_log_time: float = time.monotonic()
+        # Tokens covered by one offload chunk (GPU block_size * blocks_per_chunk).
+        # Used only for per-request eviction logging; 0 means log blocks only.
+        self._tokens_per_chunk: int = int(tokens_per_chunk) if tokens_per_chunk else 0
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -415,6 +419,23 @@ class CPUOffloadingManager(OffloadingManager):
             for key, chunk in evicted:
                 self._free_chunk(chunk)
                 to_evict.append(key)
+
+            # Per-request attribution: blocks freed to admit this request's store.
+            blocks_evicted = len(evicted)
+            tokens_evicted = (
+                blocks_evicted * self._tokens_per_chunk
+                if self._tokens_per_chunk > 0
+                else -1
+            )
+            logger.info(
+                "Request %s CPU store eviction: blocks=%d tokens=%d "
+                "session=%s stored_blocks=%d",
+                req_context.req_id,
+                blocks_evicted,
+                tokens_evicted,
+                req_context.session_id,
+                len(keys_to_store),
+            )
 
         if to_evict and self.events is not None:
             self.events.append(

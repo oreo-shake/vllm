@@ -1457,12 +1457,23 @@ class Scheduler(SchedulerInterface):
                         request.num_tokens - num_new_local_computed_tokens
                     )
                     connector_prefix_cache_hits = cpu_hit_tokens
+                    # Fine-grained tier accounting for hit analysis:
+                    # GPU = local prefix-cache hits, CPU = external/offload hits,
+                    # miss = prompt tokens that hit neither tier.
+                    prompt_tokens = int(request.num_prompt_tokens)
+                    gpu_hit_tokens = int(num_new_local_computed_tokens)
+                    miss_tokens = max(
+                        0, prompt_tokens - gpu_hit_tokens - int(cpu_hit_tokens)
+                    )
                     logger.info(
-                        "Request %s KV tier hits: GPU=%d CPU=%d "
-                        "(contiguous=%d deferred=%d spans=%s)",
+                        "Request %s KV tier hits: prompt=%d GPU=%d CPU=%d miss=%d "
+                        "session=%s (contiguous=%d deferred=%d spans=%s)",
                         request.request_id,
-                        num_new_local_computed_tokens,
+                        prompt_tokens,
+                        gpu_hit_tokens,
                         cpu_hit_tokens,
+                        miss_tokens,
+                        getattr(request, "session_id", None),
                         num_external_computed_tokens,
                         deferred_span_tokens,
                         deferred_spans,
